@@ -1,0 +1,115 @@
+# NLQ accuracy evaluation.
+#
+# Scoring is on RESULT EQUIVALENCE, not SQL string match: the agent's query and
+# the hand-written gold query must compute the same answer. Different-but-
+# correct SQL passes, which is the only fair way to grade text-to-SQL.
+#
+# `compare:` picks the strategy (see COMPARISONS in test_eval.py). All of them
+# are position-independent -- the agent may order or alias columns however it
+# likes, and may return extra columns.
+#
+#   scalar          the single number must match
+#   top_label       the top-ranked row must name the same thing
+#   labels_ordered  the ranked sequence of names must match
+#   label_set       the same set of names, any order
+
+- id: nets_tickets_last_month
+  question: How many tickets were sold for Brooklyn Nets home games last month?
+  gold_sql: |
+    SELECT COUNT(*) AS tickets_sold
+    FROM tickets t
+    JOIN orders o ON o.order_id = t.order_id
+    JOIN events e ON e.event_id = t.event_id
+    JOIN teams  h ON h.team_id = e.home_team_id
+    WHERE h.name = 'Brooklyn Nets'
+      AND e.status = 'completed'
+      AND o.status = 'completed'
+      AND t.is_comp = 0
+      AND e.event_date >= date('now','start of month','-1 month')
+      AND e.event_date <  date('now','start of month')
+  compare: scalar
+
+- id: barclays_avg_price_2024
+  question: Which events at Barclays Center had the highest average ticket price in 2024?
+  gold_sql: |
+    SELECT e.name, ROUND(AVG(t.price_paid), 2) AS avg_price
+    FROM tickets t
+    JOIN orders o ON o.order_id = t.order_id
+    JOIN events e ON e.event_id = t.event_id
+    JOIN venues v ON v.venue_id = e.venue_id
+    WHERE v.name = 'Barclays Center'
+      AND e.status = 'completed'
+      AND o.status = 'completed'
+      AND t.is_comp = 0
+      AND e.event_date >= '2024-01-01' AND e.event_date < '2025-01-01'
+    GROUP BY e.event_id, e.name
+    ORDER BY avg_price DESC
+    LIMIT 10
+  # Only the top-ranked event is asserted: the tail ordering is sensitive to
+  # tie-breaking and to how many rows the model chooses to return.
+  compare: top_label
+
+- id: top5_categories_by_revenue
+  question: Show me the top 5 event categories by total revenue.
+  gold_sql: |
+    SELECT c.name, ROUND(SUM(t.price_paid + t.fees), 2) AS revenue
+    FROM tickets t
+    JOIN orders o ON o.order_id = t.order_id
+    JOIN events e ON e.event_id = t.event_id
+    JOIN event_categories c ON c.category_id = e.category_id
+    WHERE e.status = 'completed' AND o.status = 'completed' AND t.is_comp = 0
+    GROUP BY c.category_id, c.name
+    ORDER BY revenue DESC
+    LIMIT 5
+  compare: labels_ordered
+
+- id: venue_count
+  question: How many venues do we operate?
+  gold_sql: SELECT COUNT(*) FROM venues
+  compare: scalar
+
+- id: liberty_home_games_2025
+  question: How many New York Liberty home games were played in 2025?
+  gold_sql: |
+    SELECT COUNT(*) FROM events e
+    JOIN teams h ON h.team_id = e.home_team_id
+    WHERE h.name = 'New York Liberty'
+      AND e.status = 'completed'
+      AND e.event_date >= '2025-01-01' AND e.event_date < '2026-01-01'
+  compare: scalar
+
+- id: revenue_by_channel
+  question: What is total revenue broken down by sales channel?
+  gold_sql: |
+    SELECT o.channel, ROUND(SUM(t.price_paid + t.fees), 2) AS revenue
+    FROM tickets t
+    JOIN orders o ON o.order_id = t.order_id
+    JOIN events e ON e.event_id = t.event_id
+    WHERE e.status = 'completed' AND o.status = 'completed' AND t.is_comp = 0
+    GROUP BY o.channel
+  compare: label_set
+
+- id: empty_result_1995
+  question: How many tickets were sold for events in 1995?
+  # Exercises the empty-result path. The correct behaviour is a valid query
+  # that returns zero, not a refusal.
+  gold_sql: |
+    SELECT COUNT(*) FROM tickets t
+    JOIN orders o ON o.order_id = t.order_id
+    JOIN events e ON e.event_id = t.event_id
+    WHERE o.status = 'completed' AND t.is_comp = 0
+      AND e.event_date >= '1995-01-01' AND e.event_date < '1996-01-01'
+  compare: scalar
+
+# --- must be declined -------------------------------------------------------
+- id: unanswerable_marketing
+  question: Which marketing campaign drove the most ticket sales?
+  expect_unanswerable: true
+
+- id: unanswerable_weather
+  question: What was the weather like during last month's games?
+  expect_unanswerable: true
+
+- id: unanswerable_competitor
+  question: How do our ticket prices compare to Madison Square Garden's?
+  expect_unanswerable: true
