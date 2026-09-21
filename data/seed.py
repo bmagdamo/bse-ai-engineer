@@ -155,9 +155,9 @@ def _recent_backfill(rng, anchor: date):
     events = []
     d = anchor - timedelta(days=120)
     while d <= anchor:
-        if rng.random() < 0.22:
+        if rng.random() < 0.09:
             events.append(("nba", d))
-        if rng.random() < 0.12:
+        if rng.random() < 0.10:
             events.append((rng.choice(["concert", "comedy", "family", "wnba"]), d))
         d += timedelta(days=1)
     return events
@@ -186,6 +186,29 @@ def _make_customers(rng, anchor: date, years: int, count: int = 4000) -> list:
                           f"{first.lower()}.{last.lower()}{cid}@example.com",
                           city, state, signup.isoformat(), rng.choice(TIERS)))
     return customers
+
+
+def _thin(rng, events: list, density: float) -> list:
+    """Sample the schedule down, stratified by calendar month.
+
+    Uniform random sampling leaves holes -- at density 0.25 two months of 2024
+    came out empty, which makes "revenue by month" look broken. Sampling
+    within each month instead keeps every month that had events, so a much
+    smaller (and faster to query) database still reads as a continuous
+    calendar. Per-event economics are untouched either way.
+    """
+    if density >= 1.0:
+        return events
+    by_month: dict[tuple[int, int], list] = {}
+    for item in events:
+        by_month.setdefault((item[1].year, item[1].month), []).append(item)
+
+    kept = []
+    for month in sorted(by_month):
+        bucket = by_month[month]
+        take = max(1, round(len(bucket) * density))
+        kept.extend(rng.sample(bucket, take))
+    return kept
 
 
 def _describe_event(rng, kind: str, team_names: dict[int, str]):
@@ -218,9 +241,7 @@ def _make_events(rng, anchor: date, years: int, density: float) -> tuple[list, d
     window is never thinned, so time-relative questions keep their data.
     """
     team_names = {t[0]: t[1] for t in TEAMS}
-    historical = _daterange_events(rng, anchor, years)
-    if density < 1.0:
-        historical = [item for item in historical if rng.random() < density]
+    historical = _thin(rng, _daterange_events(rng, anchor, years), density)
     raw = historical + _recent_backfill(rng, anchor)
     raw.sort(key=lambda item: item[1])
 
@@ -329,7 +350,7 @@ def _insert_orders_and_tickets(conn, rng, events, event_meta, sections_by_venue,
 
 
 def build(out_path: Path, anchor: date, years: int = 3,
-          density: float = 0.35) -> None:
+          density: float = 0.12) -> None:
     rng = random.Random(RNG_SEED)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.unlink(missing_ok=True)
@@ -372,8 +393,9 @@ def main() -> None:
                    help="Treat this date as 'today' (default: today).")
     p.add_argument("--out", default=str(HERE / "bse.db"), help="Output SQLite file.")
     p.add_argument("--years", type=int, default=3, help="Seasons of history to generate.")
-    p.add_argument("--density", type=float, default=0.35,
-                   help="Fraction of the historical schedule to generate (default 0.35). "
+    p.add_argument("--density", type=float, default=0.12,
+                   help="Fraction of the historical schedule to generate (default 0.12). "
+                        "Sampling is stratified by month, so every month keeps events. "
                         "1.0 is a full arena calendar: realistic, but ~6M tickets and a 640MB file.")
     a = p.parse_args()
     build(Path(a.out), date.fromisoformat(a.anchor_date), a.years, a.density)
