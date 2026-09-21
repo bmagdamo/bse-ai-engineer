@@ -83,3 +83,8 @@ CREATE INDEX idx_events_home     ON events(home_team_id);
 CREATE INDEX idx_orders_event    ON orders(event_id);
 CREATE INDEX idx_tickets_order   ON tickets(order_id);
 CREATE INDEX idx_tickets_event   ON tickets(event_id);
+-- Every generated query filters orders.status; these also make the prompt's
+-- value-hint lookups (SELECT DISTINCT ...) an index scan instead of a table
+-- scan over ~800k orders at agent startup.
+CREATE INDEX idx_orders_status   ON orders(status);
+CREATE INDEX idx_orders_channel  ON orders(channel);

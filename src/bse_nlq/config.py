@@ -64,7 +64,9 @@ class Settings:
     # --- database ------------------------------------------------------
     db_path: Path = REPO_ROOT / "data" / "bse.db"
     max_rows: int = 200
-    query_timeout_seconds: float = 10.0
+    # Aggregates over ~2.4M ticket rows take a couple of seconds; this is a
+    # runaway-query backstop, not a latency target.
+    query_timeout_seconds: float = 20.0
 
     # --- retries -------------------------------------------------------
     # Tenacity owns the retry policy; the SDK's own retries are disabled so
