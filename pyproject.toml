@@ -2,7 +2,10 @@
 name = "bse-nlq"
 version = "0.1.0"
 description = "Natural Language Query agent over a BSE ticketing database (candidate exercise)"
-readme = "README.md"
+# No `readme` field on purpose: hatchling requires the referenced file to
+# exist to build project metadata, which breaks a clean checkout whenever
+# the README is absent. This package is never published, so the field buys
+# nothing and only couples the build to a docs file.
 requires-python = ">=3.12"
 dependencies = [
     "anthropic>=0.40",
