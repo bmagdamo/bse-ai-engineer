@@ -22,6 +22,13 @@ _LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 #: vendored and upstream names are listed; child loggers inherit these levels.
 _NOISY_LOGGERS = ("httpx", "httpx2", "httpcore", "httpcore2", "anthropic")
 
+#: The audit trail, pinned to INFO whatever the ambient level. It is a record
+#: of what was asked and what SQL ran, not chatter about how the run went, so
+#: it is not something NLQ_LOG_LEVEL should be able to turn off: at the default
+#: WARNING every record was dropped before reaching a handler, which left the
+#: documented "unset = log only" default writing the trail nowhere at all.
+_AUDIT_LOGGER = "bse_nlq.audit"
+
 
 def resolve_level(verbose: bool = False) -> int:
     """--verbose wins, then NLQ_LOG_LEVEL, then WARNING.
@@ -47,3 +54,7 @@ def configure(verbose: bool = False) -> None:
     )
     for name in _NOISY_LOGGERS:
         logging.getLogger(name).setLevel(logging.WARNING)
+    # min(): --verbose still lowers it to DEBUG, it just cannot be raised.
+    logging.getLogger(_AUDIT_LOGGER).setLevel(
+        min(resolve_level(verbose), logging.INFO)
+    )

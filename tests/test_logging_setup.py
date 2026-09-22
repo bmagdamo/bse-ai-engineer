@@ -6,7 +6,12 @@ import logging
 
 import pytest
 
-from bse_nlq.logging_setup import _NOISY_LOGGERS, configure, resolve_level
+from bse_nlq.logging_setup import (
+    _AUDIT_LOGGER,
+    _NOISY_LOGGERS,
+    configure,
+    resolve_level,
+)
 
 
 def test_default_is_quiet():
@@ -40,6 +45,20 @@ def test_sdk_http_logging_is_suppressed():
         assert logging.getLogger(noisy).level == logging.WARNING
     # httpcore2 is the vendored transport that actually emits request bodies.
     assert "httpcore2" in _NOISY_LOGGERS
+
+
+def test_the_audit_trail_survives_the_default_level():
+    """The audit record is emitted at INFO, so at the default WARNING it was
+    dropped before reaching a handler -- an audit trail that is empty exactly
+    when nobody has configured one."""
+    configure()
+    assert logging.getLogger(_AUDIT_LOGGER).isEnabledFor(logging.INFO)
+
+
+def test_the_audit_trail_cannot_be_turned_down_by_the_env_var(monkeypatch):
+    monkeypatch.setenv("NLQ_LOG_LEVEL", "ERROR")
+    configure()
+    assert logging.getLogger(_AUDIT_LOGGER).isEnabledFor(logging.INFO)
 
 
 def test_importing_a_module_does_not_configure_logging():
