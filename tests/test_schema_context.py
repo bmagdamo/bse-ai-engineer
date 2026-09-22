@@ -51,7 +51,24 @@ def test_system_prompt_is_byte_stable(db):
 
 def test_todays_date_lives_in_the_user_turn():
     """The one volatile value goes after the cached prefix, not inside it."""
-    turn = build_question_turn("How many tickets sold last month?", "2026-09-18")
+    turn = build_question_turn(
+        "How many tickets sold last month?", "2026-09-18", "America/New_York")
     assert "2026-09-18" in turn
+    assert "America/New_York" in turn
     assert "How many tickets sold last month?" in turn
 
+
+
+def test_prompt_forbids_the_utc_now_helper():
+    """The regression this guards: the prompt used to hand the model
+    date('now'), which SQLite evaluates in UTC, while telling it today's date
+    in local time. The two disagree for part of every day, and on a month
+    boundary that silently shifts a "last month" window by a whole month.
+
+    The date recipes must therefore anchor on the literal from the user turn.
+    """
+    from bse_nlq.prompts import DATE_RECIPES, FEW_SHOT_EXAMPLES
+
+    assert "date('now'" not in DATE_RECIPES.replace("NEVER write date('now')", "")
+    assert "date('now'" not in FEW_SHOT_EXAMPLES
+    assert "TODAY" in DATE_RECIPES

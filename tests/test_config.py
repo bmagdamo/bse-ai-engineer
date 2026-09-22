@@ -78,3 +78,28 @@ def test_exported_env_var_beats_the_dotenv_file(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-from-shell")
     _load_env()
     assert os.environ["ANTHROPIC_API_KEY"] == "sk-ant-from-shell"
+
+
+@pytest.mark.parametrize("bad", [
+    {"max_repair_attempts": -1},   # made the repair loop's "unreachable" assert reachable
+    {"max_rows": 0},               # produced LIMIT 0
+    {"max_attempts": 0},           # tenacity never calls the function
+    {"timezone": "Mars/Olympus"},
+])
+def test_nonsensical_settings_are_rejected_at_construction(bad):
+    with pytest.raises(ConfigError):
+        Settings(**bad)
+
+
+def test_valid_settings_still_construct():
+    assert Settings(max_repair_attempts=0, max_rows=1).max_rows == 1
+
+
+def test_every_field_is_settable_from_the_environment():
+    """The env-var table is derived from the dataclass, not hand-written, so
+    a newly added setting cannot silently become unconfigurable."""
+    from dataclasses import fields
+
+    from bse_nlq.config import _CASTERS
+
+    assert {f.name for f in fields(Settings)} == set(_CASTERS)

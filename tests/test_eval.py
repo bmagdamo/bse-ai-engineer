@@ -19,7 +19,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from bse_nlq.agent import NLQAgent
+from bse_nlq.agent import NLQAgent, business_today
 from bse_nlq.config import SETTINGS
 from bse_nlq.db import Database
 
@@ -128,12 +128,13 @@ def test_eval_case(agent, case):
     assert result.answerable, f"agent wrongly declined: {result.answer}"
     assert result.sql, "no SQL was generated"
 
-    gold = agent.db.run_select(case["gold_sql"])
+    gold_sql = case["gold_sql"].replace("<TODAY>", business_today(SETTINGS))
+    gold = agent.db.run_select(gold_sql)
     compare = COMPARISONS[case["compare"]]
     passed, detail = compare(result.rows, gold.rows)
     assert passed, (
         f"[{case['compare']}] {detail}\n\n--- agent SQL ---\n{result.sql}"
-        f"\n\n--- gold SQL ---\n{case['gold_sql']}"
+        f"\n\n--- gold SQL ---\n{gold_sql}"
     )
     assert result.answer.strip(), "no natural-language answer was produced"
 
@@ -146,3 +147,7 @@ def test_every_case_declares_a_known_comparison():
         else:
             assert case.get("compare") in COMPARISONS, f"{case['id']}: bad compare mode"
             assert case.get("gold_sql"), f"{case['id']}: missing gold SQL"
+            assert "date('now'" not in case["gold_sql"], (
+                f"{case['id']}: gold SQL uses date('now') (UTC) while the agent is "
+                "anchored on the business timezone; use <TODAY> instead"
+            )

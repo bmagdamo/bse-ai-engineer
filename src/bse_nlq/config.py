@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import find_dotenv, load_dotenv
 
@@ -16,15 +17,12 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 def _load_env() -> Path | None:
     """Load .env before any setting is read.
 
-    Prefer a .env found by walking up from the current working directory (so a
-    developer can keep a local override wherever they are), then fall back to
-    the one next to the repo. The fallback is what makes `nlq` work when it is
-    invoked from outside the project directory -- a bare load_dotenv() would
-    silently find nothing and the agent would fail with "no API key" even
-    though the file exists.
+    Walking up from the cwd first lets a developer keep a local override
+    anywhere; the repo-root fallback is what makes `nlq` work when invoked
+    from outside the project, where a bare load_dotenv() would find nothing
+    and the agent would fail with "no API key" despite the file existing.
 
-    Values already present in the real environment always win: an explicit
-    `export ANTHROPIC_API_KEY=...` overrides whatever is in the file.
+    Real environment variables always win over the file.
     """
     for candidate in (find_dotenv(usecwd=True), REPO_ROOT / ".env"):
         path = Path(candidate) if candidate else None
@@ -41,11 +39,10 @@ DOTENV_PATH = _load_env()
 class Settings:
     """Immutable configuration.
 
-    Defaults are plain literals, not os.getenv() calls. Reading the
-    environment in field defaults would bind it once at import time, which
-    makes the value invisible to tests and dependent on import order -- so the
-    environment is read in `from_env()` instead, and `Settings()` on its own is
-    a pure, predictable object.
+    Defaults are plain literals, never os.getenv(): reading the environment in
+    a field default binds it once at import, which makes the value invisible
+    to tests and dependent on import order. `from_env()` reads the
+    environment, so `Settings()` alone stays pure and predictable.
     """
 
     # --- model ---------------------------------------------------------
@@ -64,6 +61,10 @@ class Settings:
     # --- database ------------------------------------------------------
     db_path: Path = REPO_ROOT / "data" / "bse.db"
     max_rows: int = 200
+    # The business calendar. "Last month" is resolved in this zone and passed
+    # to the model as a literal date, because SQLite's date('now') is UTC and
+    # would disagree with it for part of every day. See prompts.DATE_RECIPES.
+    timezone: str = "America/New_York"
     # Aggregates over ~2.4M ticket rows take a couple of seconds; this is a
     # runaway-query backstop, not a latency target.
     query_timeout_seconds: float = 20.0
@@ -74,6 +75,11 @@ class Settings:
     max_attempts: int = 3
     retry_initial_seconds: float = 1.0
     retry_max_seconds: float = 10.0
+    # A server-sent `retry-after` is honoured in full rather than clamped to
+    # retry_max_seconds -- waiting less than the service asked for is how you
+    # get rate-limited again immediately. This is the ceiling on trusting it,
+    # so a pathological header cannot hang an interactive session.
+    retry_after_max_seconds: float = 60.0
     request_timeout_seconds: float = 120.0
 
     # --- agent ---------------------------------------------------------
@@ -83,30 +89,42 @@ class Settings:
 
     @classmethod
     def from_env(cls, **overrides) -> Settings:
-        """Build settings from environment variables, then apply overrides.
+        """Build settings from NLQ_* environment variables, then apply
+        overrides (CLI flags), which always win.
 
-        Overrides come from CLI flags and always win over the environment.
+        Fields and their casters are derived from the dataclass rather than
+        listed by hand: a hand-kept list silently ignores any field someone
+        forgets to add to it.
         """
-        env: dict = {}
-        for field_name, caster in (
-            ("model", str), ("sql_effort", str), ("answer_effort", str),
-            ("sql_max_tokens", int), ("answer_max_tokens", int),
-            ("db_path", Path), ("max_rows", int),
-            ("query_timeout_seconds", float), ("max_repair_attempts", int),
-            ("max_attempts", int), ("retry_initial_seconds", float),
-            ("retry_max_seconds", float), ("request_timeout_seconds", float),
-        ):
-            raw = os.getenv(f"NLQ_{field_name.upper()}")
-            if raw is None or raw.strip() == "":
+        env = {}
+        for name, caster in _CASTERS.items():
+            raw = (os.getenv(f"NLQ_{name.upper()}") or "").strip()
+            if not raw:
                 continue
             try:
-                env[field_name] = caster(raw.strip())
+                env[name] = caster(raw)
             except ValueError as exc:
                 raise ConfigError(
-                    f"NLQ_{field_name.upper()} is not a valid "
-                    f"{caster.__name__}: {raw!r}"
+                    f"NLQ_{name.upper()} is not a valid {caster.__name__}: {raw!r}"
                 ) from exc
-        return cls(**{**env, **{k: v for k, v in overrides.items() if v is not None}})
+        return cls(**env | {k: v for k, v in overrides.items() if v is not None})
+
+    def __post_init__(self) -> None:
+        """Reject values that would otherwise fail far from their cause: a
+        negative max_repair_attempts made the repair loop iterate zero times
+        and hit its "unreachable" assertion, and max_rows below 1 produced a
+        LIMIT 0. Failing here names the setting instead."""
+        for name, floor in _FLOORS.items():
+            if getattr(self, name) < floor:
+                raise ConfigError(
+                    f"NLQ_{name.upper()} must be >= {floor}, got {getattr(self, name)!r}."
+                )
+        try:
+            ZoneInfo(self.timezone)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ConfigError(
+                f"NLQ_TIMEZONE is not a known IANA timezone: {self.timezone!r}."
+            ) from exc
 
     # --- preconditions -------------------------------------------------
 
@@ -129,6 +147,19 @@ class Settings:
             )
         return self.db_path
 
+
+#: Minimum sensible value per field; anything lower fails at construction.
+_FLOORS = {
+    "max_rows": 1, "max_attempts": 1, "max_repair_attempts": 0,
+    "query_timeout_seconds": 0, "sql_max_tokens": 1, "answer_max_tokens": 1,
+}
+
+#: field -> caster, derived from the annotations so the two cannot drift.
+#: `f.type` is the annotation *string* because of `from __future__ import
+#: annotations`. A field of a new type raises KeyError here at import, which
+#: is the point: adding one forces a decision about how to parse it.
+_TYPES = {"str": str, "int": int, "float": float, "Path": Path}
+_CASTERS = {f.name: _TYPES[f.type] for f in fields(Settings)}
 
 #: Process-wide settings, resolved once from the environment at import.
 SETTINGS = Settings.from_env()

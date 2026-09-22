@@ -2,10 +2,9 @@
 
     plan -> [decline?] -> guard -> execute -> [repair once?] -> synthesize
 
-Two model calls per question. The planning step uses structured outputs so
-"I cannot answer that" is a parseable state rather than prose we would have to
-pattern-match. Synthesis is a separate, cheaper call that never sees the
-schema -- it only turns rows into a sentence.
+Two model calls per question. Planning uses structured outputs so "I cannot
+answer that" is a parseable state rather than prose we would pattern-match.
+Synthesis is a separate, cheaper call that never sees the schema.
 
 The agent depends on the `ModelClient` protocol, not on `anthropic`, so the
 whole pipeline is exercisable in tests without network access.
@@ -15,18 +14,31 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import datetime
 from enum import StrEnum
+from zoneinfo import ZoneInfo
 
 from bse_nlq import formatter, guards, prompts
 from bse_nlq.claude import ClaudeClient, Message, ModelClient, ModelRequest, TokenUsage
 from bse_nlq.config import SETTINGS, Settings
 from bse_nlq.db import Database, QueryResult
 from bse_nlq.errors import ModelError, NLQError, QueryExecutionError
-from bse_nlq.models import SqlPlan, sql_plan_json_schema
+from bse_nlq.models import SqlPlan
 from bse_nlq.schema_context import build_schema_context
 
 log = logging.getLogger(__name__)
+
+
+def business_today(settings: Settings) -> str:
+    """Today on the business calendar, as 'YYYY-MM-DD'.
+
+    The single source of truth for "now". date.today() is the host's local
+    date and SQLite's date('now') is UTC; anchoring the prompt on one and the
+    generated SQL on the other made them disagree for part of every day, and
+    on a month boundary that silently shifted a "last month" window by a whole
+    month. The eval's gold SQL anchors on this too, so the two cannot drift.
+    """
+    return datetime.now(ZoneInfo(settings.timezone)).date().isoformat()
 
 
 class Outcome(StrEnum):
@@ -35,7 +47,7 @@ class Outcome(StrEnum):
 
     ANSWERED = "answered"
     DECLINED = "declined"   # the database cannot answer this; not a failure
-    FAILED = "failed"       # something went wrong
+    FAILED = "failed"
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,23 +106,16 @@ class _Run:
 
 
 class NLQAgent:
-    """Stateless across questions -- each ask() is an independent turn.
-
-    Multi-turn memory is out of scope for this exercise; see the README.
-    """
+    """Stateless across questions -- each ask() is an independent turn."""
 
     def __init__(self, db: Database, settings: Settings = SETTINGS,
                  client: ModelClient | None = None):
         self.db = db
         self.settings = settings
-        # Dependency injection with a sensible production default: tests pass
-        # a fake, the CLI passes nothing.
-        self.client = client or ClaudeClient(settings.model)
-        # Built once. Keeping this string byte-identical between questions is
-        # what makes the prompt cache hit.
+        self.client = client or ClaudeClient(settings.model, settings=settings)
+        # Built once, and byte-identical between questions: that is what makes
+        # the prompt cache hit.
         self.system_prompt = prompts.build_system_prompt(build_schema_context(db))
-
-    # -- public API -------------------------------------------------------
 
     def ask(self, question: str) -> NLQResult:
         """Answer one question.
@@ -128,14 +133,6 @@ class NLQAgent:
         except NLQError as exc:
             log.warning("Question failed (%s): %s", type(exc).__name__, exc)
             return self._failure(run, exc.user_message)
-
-    def describe_scope(self) -> str:
-        """What this database can answer -- appended when a question is declined."""
-        tables = ", ".join(table.name for table in self.db.tables())
-        return (
-            "This database covers BSE ticketing: events, venues, teams, seating "
-            f"sections, customers, orders and tickets ({tables})."
-        )
 
     # -- pipeline ---------------------------------------------------------
 
@@ -171,10 +168,10 @@ class NLQAgent:
         """Guard and run the query, allowing a bounded number of repairs.
 
         A guard failure is deliberately *not* repaired: unsafe SQL means the
-        prompt is wrong, and retrying would just burn tokens on the same bug.
+        prompt is wrong, and retrying would burn tokens on the same bug.
         """
         for remaining in range(self.settings.max_repair_attempts, -1, -1):
-            sql, _ = guards.enforce_limit(plan.sql, self.settings.max_rows)
+            sql, limit_added = guards.enforce_limit(plan.sql, self.settings.max_rows)
             try:
                 result = self.db.run_select(sql)
             except QueryExecutionError as exc:
@@ -197,10 +194,23 @@ class NLQAgent:
                 continue
 
             run.attempts.append(Attempt(sql=sql))
-            log.debug("Query returned %d rows in %.2fs", len(result.rows), result.elapsed_seconds)
+            result.truncated = result.truncated or self._capped(result, limit_added)
             return plan, result, sql
 
-        raise AssertionError("unreachable: the loop always returns or raises")
+        raise AssertionError("unreachable: Settings rejects a negative repair count")
+
+    def _capped(self, result: QueryResult, limit_added: bool) -> bool:
+        """Did *our* row cap bind this result?
+
+        Database.run_select detects truncation by fetching one row past its
+        cap, but guards.enforce_limit has already put LIMIT max_rows into the
+        SQL, so that row can never come back and the flag stays False however
+        many rows matched. Reconstruct it here.
+
+        Only a limit *we* injected counts: a model-authored "LIMIT 10" for a
+        top-10 question is a complete answer, not a truncated one.
+        """
+        return limit_added and len(result.rows) >= self.settings.max_rows
 
     # -- model calls ------------------------------------------------------
 
@@ -208,10 +218,10 @@ class NLQAgent:
         return ModelRequest(
             system=self.system_prompt,
             messages=(Message("user", prompts.build_question_turn(
-                question, date.today().isoformat())),),
+                question, business_today(self.settings), self.settings.timezone)),),
             max_tokens=self.settings.sql_max_tokens,
             effort=self.settings.sql_effort,
-            response_schema=sql_plan_json_schema(),
+            response_schema=SqlPlan.model_json_schema(),
         )
 
     def _plan(self, run: _Run) -> SqlPlan:
@@ -222,7 +232,7 @@ class NLQAgent:
             return SqlPlan.model_validate_json(response.text)
         except ValueError as exc:
             # Structured outputs make this near-impossible, but a malformed
-            # payload should still be a clean message rather than a traceback.
+            # payload should be a clean message rather than a traceback.
             raise ModelError(
                 "The model returned a response I could not read. Please try rephrasing.",
                 f"{exc}: {response.text[:200]}",
@@ -230,7 +240,7 @@ class NLQAgent:
 
     def _synthesize(self, run: _Run, sql: str, result: QueryResult) -> str:
         """Rows -> plain-English answer. Cheap call; no schema needed."""
-        request = ModelRequest(
+        response = self.client.complete(ModelRequest(
             system=prompts.ANSWER_SYSTEM_PROMPT,
             messages=(Message("user", prompts.build_answer_turn(
                 question=run.question,
@@ -241,12 +251,19 @@ class NLQAgent:
             )),),
             max_tokens=self.settings.answer_max_tokens,
             effort=self.settings.answer_effort,
-        )
-        response = self.client.complete(request)
+        ))
         run.usage += response.usage
         return response.text.strip()
 
     # -- result builders --------------------------------------------------
+
+    def _scope(self) -> str:
+        """What this database can answer -- appended when a question is declined."""
+        tables = ", ".join(table.name for table in self.db.tables())
+        return (
+            "This database covers BSE ticketing: events, venues, teams, seating "
+            f"sections, customers, orders and tickets ({tables})."
+        )
 
     def _declined(self, run: _Run, plan: SqlPlan) -> NLQResult:
         reason = plan.unanswerable_reason or "This question cannot be answered from this database."
@@ -254,17 +271,16 @@ class NLQAgent:
         return NLQResult(
             question=run.question,
             outcome=Outcome.DECLINED,
-            answer=f"{reason}\n\n{self.describe_scope()}",
+            answer=f"{reason}\n\n{self._scope()}",
             usage=run.usage,
         )
 
     def _failure(self, run: _Run, message: str) -> NLQResult:
-        last_sql = run.attempts[-1].sql if run.attempts else ""
         return NLQResult(
             question=run.question,
             outcome=Outcome.FAILED,
             answer=message,
-            sql=last_sql,
+            sql=run.attempts[-1].sql if run.attempts else "",
             attempts=tuple(run.attempts),
             usage=run.usage,
         )

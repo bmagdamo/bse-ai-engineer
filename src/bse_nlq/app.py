@@ -67,7 +67,7 @@ if question:
         st.subheader(f"Results ({result.row_count} rows)")
         st.dataframe(formatter.to_dicts(result), use_container_width=True)
         if result.truncated:
-            st.caption("Truncated at the row cap; more rows exist.")
+            st.caption(f"Capped at the {result.row_count}-row limit; there may be more.")
 
     if result.assumptions:
         with st.expander("Assumptions"):

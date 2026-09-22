@@ -61,3 +61,32 @@ def test_introspection_reads_foreign_keys(db):
     refs = {(c, rt) for c, rt, _ in events.foreign_keys}
     assert ("venue_id", "venues") in refs
     assert ("home_team_id", "teams") in refs
+
+
+def test_recursive_cte_is_allowed(db):
+    """WITH RECURSIVE takes a SQLITE_RECURSIVE step that the authorizer used
+    to deny, so a legitimate query came back as a bare "not authorized" and
+    the agent spent its one repair attempt on SQL that was never wrong.
+
+    A recursive date spine -- revenue per month including months with no
+    events -- is an ordinary analyst query, not an escape hatch.
+    """
+    result = db.run_select(
+        "WITH RECURSIVE months(d) AS ("
+        "  SELECT '2026-01-01' UNION ALL"
+        "  SELECT date(d, '+1 month') FROM months WHERE d < '2026-06-01'"
+        ") SELECT d FROM months"
+    )
+    assert [r[0] for r in result.rows] == [
+        "2026-01-01", "2026-02-01", "2026-03-01",
+        "2026-04-01", "2026-05-01", "2026-06-01",
+    ]
+
+
+def test_recursion_does_not_widen_the_write_boundary(db):
+    """Allowing SQLITE_RECURSIVE must not make a write reachable through one."""
+    with pytest.raises((QueryExecutionError, sqlite3.Error)):
+        db.run_select(
+            "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<3) "
+            "INSERT INTO venues SELECT 99,'x','y','z',x FROM n"
+        )

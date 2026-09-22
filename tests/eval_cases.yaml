@@ -12,6 +12,11 @@
 #   top_label       the top-ranked row must name the same thing
 #   labels_ordered  the ranked sequence of names must match
 #   label_set       the same set of names, any order
+#
+# <TODAY> is substituted with the business-calendar date the agent itself was
+# given (agent.business_today). Gold SQL must NOT use date('now'): that is UTC,
+# while the agent is anchored on the business timezone, so on a month boundary
+# the two would grade different months against each other.
 
 - id: nets_tickets_last_month
   question: How many tickets were sold for Brooklyn Nets home games last month?
@@ -25,8 +30,8 @@
       AND e.status = 'completed'
       AND o.status = 'completed'
       AND t.is_comp = 0
-      AND e.event_date >= date('now','start of month','-1 month')
-      AND e.event_date <  date('now','start of month')
+      AND e.event_date >= date('<TODAY>','start of month','-1 month')
+      AND e.event_date <  date('<TODAY>','start of month')
   compare: scalar
 
 - id: barclays_avg_price_2024

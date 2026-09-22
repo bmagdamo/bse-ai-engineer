@@ -22,11 +22,9 @@ def _cell(value: object) -> str:
 
 
 def to_markdown(result: QueryResult, max_rows: int = MAX_ROWS_FOR_MODEL) -> str:
-    """Render rows as a markdown table for the answer-synthesis prompt.
-
-    Capped independently of the display cap: the synthesis step only needs
-    enough rows to describe the shape of the answer, not all of them.
-    """
+    """Rows as a markdown table for the answer-synthesis prompt. Capped
+    independently of the display cap: synthesis only needs enough rows to
+    describe the shape of the answer, not all of them."""
     if not result.rows:
         return "(no rows)"
 
@@ -50,8 +48,21 @@ def to_rich_table(result: QueryResult, max_rows: int = 25) -> Table:
     return table
 
 
+def _unique_columns(columns: list[str]) -> list[str]:
+    """Disambiguate repeated column names. SQLite returns two columns called
+    "name" for any self-join, and keying a dict on those drops all but the
+    last -- the dataframe loses a column with no error anywhere."""
+    seen: dict[str, int] = {}
+    out = []
+    for column in columns:
+        seen[column] = seen.get(column, 0) + 1
+        out.append(column if seen[column] == 1 else f"{column}_{seen[column]}")
+    return out
+
+
 def to_dicts(result: QueryResult) -> list[dict]:
     """Row dicts, for the Streamlit dataframe."""
+    columns = _unique_columns(result.columns)
     # strict=True: a row that does not line up with the header is a bug in
     # the DB layer, not something to silently truncate.
-    return [dict(zip(result.columns, row, strict=True)) for row in result.rows]
+    return [dict(zip(columns, row, strict=True)) for row in result.rows]

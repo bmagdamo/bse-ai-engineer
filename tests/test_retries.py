@@ -133,3 +133,34 @@ def test_retries_are_logged(caplog):
     with caplog.at_level(logging.WARNING, logger="bse_nlq.claude"):
         _client(sdk).complete(_request())
     assert any("retrying" in record.getMessage().lower() for record in caplog.records)
+
+
+def test_server_retry_after_is_honoured_beyond_our_own_backoff_ceiling():
+    """retry_max_seconds bounds *our* guess at a backoff. Clamping the
+    server's own `retry-after` to it meant waiting 10s when the API asked for
+    60 -- which is how you get rate-limited again immediately."""
+    from unittest.mock import Mock
+
+    from bse_nlq.claude import _wait_policy
+    from bse_nlq.config import Settings
+    from bse_nlq.errors import TransientModelError
+
+    settings = Settings(retry_max_seconds=10.0, retry_after_max_seconds=60.0)
+    state = Mock()
+    state.outcome.exception.return_value = TransientModelError("rl", retry_after=45.0)
+
+    assert _wait_policy(settings)(state) == 45.0
+
+
+def test_a_pathological_retry_after_is_still_bounded():
+    from unittest.mock import Mock
+
+    from bse_nlq.claude import _wait_policy
+    from bse_nlq.config import Settings
+    from bse_nlq.errors import TransientModelError
+
+    settings = Settings(retry_after_max_seconds=60.0)
+    state = Mock()
+    state.outcome.exception.return_value = TransientModelError("rl", retry_after=86_400.0)
+
+    assert _wait_policy(settings)(state) == 60.0

@@ -73,20 +73,29 @@ DATE_RECIPES = """\
 event_date is TEXT in 'YYYY-MM-DD' form, so ordinary string comparison works
 and is index-friendly. Prefer half-open ranges over strftime() where possible.
 
+NEVER write date('now'). SQLite evaluates 'now' in UTC, which disagrees with
+the business calendar for part of every day -- on a month boundary that
+silently shifts a "last month" window by a whole month. The user turn gives
+you today's date in the business timezone. Substitute it, as a quoted literal,
+everywhere a recipe below shows TODAY.
+
 - last calendar month:
-      e.event_date >= date('now', 'start of month', '-1 month')
-      AND e.event_date <  date('now', 'start of month')
+      e.event_date >= date('TODAY', 'start of month', '-1 month')
+      AND e.event_date <  date('TODAY', 'start of month')
 - this calendar month:
-      e.event_date >= date('now', 'start of month')
+      e.event_date >= date('TODAY', 'start of month')
 - a calendar year (2024):
       e.event_date >= '2024-01-01' AND e.event_date < '2025-01-01'
 - trailing 30 days:
-      e.event_date >= date('now', '-30 days')
+      e.event_date >= date('TODAY', '-30 days')
 - last calendar year:
-      e.event_date >= date('now', 'start of year', '-1 year')
-      AND e.event_date <  date('now', 'start of year')
+      e.event_date >= date('TODAY', 'start of year', '-1 year')
+      AND e.event_date <  date('TODAY', 'start of year')
 - grouping by month:      strftime('%Y-%m', e.event_date)
 - grouping by year:       strftime('%Y', e.event_date)
+
+So if the user turn says today is 2026-09-21, "last month" becomes
+date('2026-09-21', 'start of month', '-1 month') -- a literal, not 'now'.
 
 orders.order_ts is 'YYYY-MM-DD HH:MM:SS'; use date(o.order_ts) to compare it
 against a day.
@@ -96,11 +105,14 @@ against a day.
 FEW_SHOT_EXAMPLES = """\
 ## Worked examples
 
+(The first example uses 2019-04-08 only to show the shape -- it is NOT today.
+Always substitute the date the user turn actually gives you.)
+
 Q: "How many tickets were sold for Brooklyn Nets home games last month?"
 {"is_answerable": true,
- "sql": "SELECT COUNT(*) AS tickets_sold FROM tickets t JOIN orders o ON o.order_id = t.order_id JOIN events e ON e.event_id = t.event_id JOIN teams h ON h.team_id = e.home_team_id WHERE h.name LIKE '%Brooklyn Nets%' AND e.status = 'completed' AND o.status = 'completed' AND t.is_comp = 0 AND e.event_date >= date('now','start of month','-1 month') AND e.event_date < date('now','start of month') LIMIT 100",
+ "sql": "SELECT COUNT(*) AS tickets_sold FROM tickets t JOIN orders o ON o.order_id = t.order_id JOIN events e ON e.event_id = t.event_id JOIN teams h ON h.team_id = e.home_team_id WHERE h.name LIKE '%Brooklyn Nets%' AND e.status = 'completed' AND o.status = 'completed' AND t.is_comp = 0 AND e.event_date >= date('2019-04-08','start of month','-1 month') AND e.event_date < date('2019-04-08','start of month') LIMIT 100",
  "explanation": "Counts non-complimentary tickets on completed orders for Nets home games that took place last calendar month.",
- "assumptions": ["Excludes refunded/cancelled orders and complimentary tickets.", "'Last month' means the previous calendar month, not the trailing 30 days."],
+ "assumptions": ["Excludes refunded/cancelled orders and complimentary tickets.", "'Last month' means the previous calendar month, not the trailing 30 days.", "Anchored on today's date as given in the question turn."],
  "unanswerable_reason": ""}
 
 Q: "Which events at Barclays Center had the highest average ticket price in 2024?"
@@ -146,10 +158,20 @@ def build_system_prompt(schema_context: str) -> str:
     ])
 
 
-def build_question_turn(question: str, today: str) -> str:
+def build_question_turn(question: str, today: str, timezone: str) -> str:
     """The user turn. Volatile content (today's date) lives here, after the
-    cached system prefix, so it never invalidates the cache."""
-    return f"Today's date is {today}.\n\nQuestion: {question}"
+    cached system prefix, so it never invalidates the cache.
+
+    `today` is already resolved in the business timezone, and the date recipes
+    tell the model to substitute it for TODAY rather than call date('now').
+    That is what keeps the prompt's idea of "today" and the executed SQL's idea
+    of "today" from being two different days.
+    """
+    return (
+        f"Today's date is {today} ({timezone}).\n"
+        f"Use '{today}' as the TODAY literal in the date recipes; do not use date('now').\n\n"
+        f"Question: {question}"
+    )
 
 
 def build_repair_turn(failed_sql: str, error: str) -> str:

@@ -1,7 +1,7 @@
 """The boundary between the agent and the Claude API.
 
 Everything provider-specific lives here: request shaping, prompt-cache
-placement, error translation, and usage accounting. `NLQAgent` depends on the
+placement, error translation, usage accounting. The agent depends on the
 `ModelClient` protocol rather than on `anthropic`, which keeps the pipeline
 testable without network access and confines an SDK change to this file.
 """
@@ -40,7 +40,7 @@ class Message:
 
 @dataclass(frozen=True, slots=True)
 class TokenUsage:
-    """Immutable token tally. Accumulate with `+`, never by mutation."""
+    """Immutable token tally. Accumulate with `+`."""
 
     calls: int = 0
     input_tokens: int = 0
@@ -91,16 +91,22 @@ class ModelResponse:
 
 @runtime_checkable
 class ModelClient(Protocol):
-    """What the agent needs from a language model. Implemented by
-    `ClaudeClient` in production and by a fake in the tests."""
+    """What the agent needs from a language model: `ClaudeClient` in
+    production, a fake in the tests."""
 
     def complete(self, request: ModelRequest) -> ModelResponse: ...
 
 
 def _wait_policy(settings: Settings):
-    """Exponential backoff with jitter, but defer to a server-supplied
-    `retry-after` when there is one -- guessing shorter than the service asked
-    for is how you get rate-limited again immediately."""
+    """Exponential backoff with jitter, deferring to a server-supplied
+    `retry-after` -- waiting less than the service asked for is how you get
+    rate-limited again immediately.
+
+    That figure is honoured in full rather than clamped to retry_max_seconds,
+    which bounds our *own* guess and is routinely shorter than a real
+    rate-limit window. retry_after_max_seconds is the separate, larger ceiling
+    that stops a pathological header from hanging the CLI.
+    """
     backoff = wait_exponential_jitter(
         initial=settings.retry_initial_seconds, max=settings.retry_max_seconds
     )
@@ -109,7 +115,7 @@ def _wait_policy(settings: Settings):
         exc = state.outcome.exception() if state.outcome else None
         retry_after = getattr(exc, "retry_after", None)
         if retry_after is not None:
-            return min(float(retry_after), settings.retry_max_seconds)
+            return min(float(retry_after), settings.retry_after_max_seconds)
         return backoff(state)
 
     return wait
@@ -127,14 +133,17 @@ def _log_retry(state: RetryCallState) -> None:
 class ClaudeClient:
     """`ModelClient` backed by the Anthropic API.
 
-    Retries are owned here via tenacity and the SDK's own retry loop is
-    disabled (`max_retries=0`). Leaving both enabled multiplies attempts --
-    3 tenacity attempts over 3 SDK attempts is 9 real API calls -- and makes
-    the effective backoff impossible to reason about.
+    Tenacity owns retries and the SDK's own loop is disabled
+    (`max_retries=0`). Both enabled multiplies attempts -- 3 over 3 is 9 real
+    calls -- and makes the effective backoff impossible to reason about.
     """
 
     def __init__(self, model: str, client: anthropic.Anthropic | None = None,
-                 settings: Settings = SETTINGS):
+                 settings: Settings | None = None):
+        # Resolved here, not bound to the module singleton as a default arg at
+        # import: a caller with its own Settings (CLI flags, tests) would
+        # otherwise have its retry policy and timeout silently ignored.
+        settings = settings or SETTINGS
         self.model = model
         self.settings = settings
         self._client = client or anthropic.Anthropic(
@@ -144,14 +153,13 @@ class ClaudeClient:
 
     def complete(self, request: ModelRequest) -> ModelResponse:
         """Send one request, retrying only transient failures."""
-        retryer = Retrying(
+        return Retrying(
             retry=retry_if_exception_type(TransientModelError),
             stop=stop_after_attempt(self.settings.max_attempts),
             wait=_wait_policy(self.settings),
             before_sleep=_log_retry,
             reraise=True,
-        )
-        return retryer(self._complete_once, request)
+        )(self._complete_once, request)
 
     def _complete_once(self, request: ModelRequest) -> ModelResponse:
         output_config: dict = {"effort": request.effort}
@@ -215,7 +223,6 @@ class ClaudeClient:
         picks them up; everything else fails fast -- retrying a bad API key
         just delays the same error behind three backoffs.
         """
-        # -- permanent: retrying cannot help --------------------------------
         if isinstance(exc, anthropic.AuthenticationError):
             return ModelError(
                 "Claude API authentication failed. Check that ANTHROPIC_API_KEY is valid."
@@ -228,7 +235,6 @@ class ClaudeClient:
         if isinstance(exc, anthropic.NotFoundError):
             return ModelError(f"Model '{self.model}' was not found.")
 
-        # -- transient: worth another attempt -------------------------------
         if isinstance(exc, anthropic.RateLimitError):
             retry_after = self._retry_after(exc)
             hint = f"{retry_after:.0f}" if retry_after is not None else "a few"

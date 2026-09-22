@@ -10,7 +10,7 @@ from __future__ import annotations
 import pytest
 
 from bse_nlq.agent import NLQAgent, Outcome
-from bse_nlq.config import SETTINGS
+from bse_nlq.config import SETTINGS, Settings
 from bse_nlq.errors import ModelError
 from tests.fakes import FakeModelClient, declined, plan
 
@@ -164,3 +164,88 @@ def test_row_cap_is_disclosed_as_an_assumption(db, truncating_sql):
     result = agent.ask("List every event")
     assert result.truncated
     assert any("capped at" in a for a in result.assumptions)
+
+
+# --- row cap disclosure -----------------------------------------------------
+# These run with db.max_rows == settings.max_rows, which is how cli.py and
+# app.py actually wire it. The older test above passes only because its
+# fixture gives the Database a *smaller* cap (50) than settings (200), which
+# is what let the production bug hide: guards.enforce_limit puts
+# LIMIT <max_rows> into the SQL, so Database can never fetch the extra row it
+# uses to detect truncation, and result.truncated was always False.
+
+@pytest.fixture
+def capped(db_path):
+    """A Database and Settings that agree on the cap, as production does."""
+    from bse_nlq.db import Database
+
+    settings = Settings(max_rows=5, db_path=SETTINGS.db_path)
+    with Database(db_path, max_rows=settings.max_rows, timeout_seconds=10) as handle:
+        yield handle, settings
+
+
+def test_row_cap_is_disclosed_when_db_and_settings_agree(capped):
+    db, settings = capped
+    total = db.run_select("SELECT COUNT(*) FROM events").rows[0][0]
+    assert total > settings.max_rows, "fixture needs a table bigger than the cap"
+
+    agent = NLQAgent(db, settings,
+                     client=FakeModelClient(plan("SELECT event_id FROM events"), "ok"))
+    result = agent.ask("List every event")
+
+    assert result.row_count == settings.max_rows
+    assert result.truncated, "the user was never told the list was partial"
+    assert any("capped at" in a for a in result.assumptions)
+
+
+def test_a_model_authored_top_n_is_not_reported_as_truncated(capped):
+    """A "top 3" question returns three rows because three were asked for.
+    Calling that truncated would tell the user their complete answer is
+    partial."""
+    db, settings = capped
+    agent = NLQAgent(db, settings,
+                     client=FakeModelClient(plan("SELECT event_id FROM events LIMIT 3"), "ok"))
+    result = agent.ask("Top 3 events")
+
+    assert result.row_count == 3
+    assert not result.truncated
+    assert not any("capped at" in a for a in result.assumptions)
+
+
+# --- settings propagation ---------------------------------------------------
+
+def test_agent_settings_reach_the_model_client(db, monkeypatch):
+    """ClaudeClient used to default to the import-time SETTINGS singleton, so
+    an agent built with its own Settings got someone else's retry policy and
+    request timeout."""
+    import anthropic
+
+    from bse_nlq.claude import ClaudeClient
+
+    monkeypatch.setattr(anthropic, "Anthropic", lambda **_kwargs: object())
+    settings = Settings(max_attempts=7, request_timeout_seconds=3.0,
+                        model="claude-haiku-4-5-20251001")
+    agent = NLQAgent(db, settings)
+
+    assert isinstance(agent.client, ClaudeClient)
+    assert agent.client.settings is settings
+    assert agent.client.settings.max_attempts == 7
+
+
+# --- the business calendar --------------------------------------------------
+
+def test_todays_date_is_resolved_in_the_business_timezone(db):
+    """The prompt's "today" and the SQL's "today" must be the same day. The
+    agent resolves it once, in the configured zone, and hands the model a
+    literal -- date('now') (UTC) is banned by the prompt."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    settings = Settings(timezone="Pacific/Kiritimati")   # UTC+14, far from UTC
+    agent = NLQAgent(db, settings, client=FakeModelClient(plan("SELECT 1 AS n"), "ok"))
+    agent.ask("anything")
+
+    expected = datetime.now(ZoneInfo("Pacific/Kiritimati")).date().isoformat()
+    turn = agent.client.requests[0].messages[0].content
+    assert expected in turn
+    assert "Pacific/Kiritimati" in turn

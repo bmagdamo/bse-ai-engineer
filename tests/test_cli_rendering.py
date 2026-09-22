@@ -79,3 +79,19 @@ def test_show_sql_only_prints_just_the_query(capture):
 @pytest.mark.parametrize("outcome", list(Outcome))
 def test_every_outcome_has_a_panel_style(outcome):
     assert outcome in cli._OUTCOME_STYLE
+
+
+def test_duplicate_column_names_are_not_silently_dropped():
+    """A self-join returns two columns called "name". Keying a dict on the raw
+    names kept only the last, so the Streamlit dataframe lost a column with no
+    error raised anywhere."""
+    from bse_nlq.db import QueryResult
+    from bse_nlq.formatter import to_dicts
+
+    result = QueryResult(columns=["name", "name", "n"],
+                         rows=[("Barclays Center", "Prudential Center", 3)],
+                         truncated=False, elapsed_seconds=0.0)
+    rows = to_dicts(result)
+
+    assert len(rows[0]) == 3, f"a column was dropped: {rows[0]}"
+    assert list(rows[0].values()) == ["Barclays Center", "Prudential Center", 3]

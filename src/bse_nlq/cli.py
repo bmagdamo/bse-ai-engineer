@@ -1,8 +1,7 @@
 """Command-line interface.
 
-Presentation only: it parses arguments, calls NLQAgent.ask(), and renders.
-All behaviour lives in the agent, which is why app.py can be a thin wrapper
-with no duplicated logic.
+Presentation only: parse arguments, call NLQAgent.ask(), render. All
+behaviour lives in the agent, which is why app.py duplicates no logic.
 """
 
 from __future__ import annotations
@@ -67,7 +66,8 @@ def _render_rows(result: NLQResult) -> None:
                   f"{result.elapsed_seconds:.2f}s)[/dim]")
     console.print(formatter.to_rich_table(result, MAX_DISPLAY_ROWS))
     if result.truncated:
-        console.print("[dim]…truncated at the row cap; more rows exist.[/dim]")
+        console.print(f"[dim]…capped at the {result.row_count}-row limit; "
+                      "there may be more.[/dim]")
     elif result.row_count > MAX_DISPLAY_ROWS:
         console.print(f"[dim]…showing first {MAX_DISPLAY_ROWS} of {result.row_count} rows.[/dim]")
 
@@ -113,7 +113,7 @@ def run_repl(agent: NLQAgent, show_sql_only: bool) -> int:
 
 
 def run_demo(agent: NLQAgent, show_sql_only: bool) -> int:
-    """Exit non-zero if any question errored, so --demo works as a smoke test."""
+    """Exit non-zero if any question errored, so --demo is a smoke test."""
     failures = 0
     for question in EXAMPLE_QUESTIONS:
         console.rule(f"[bold]{escape(question)}")
@@ -124,7 +124,7 @@ def run_demo(agent: NLQAgent, show_sql_only: bool) -> int:
 
 
 def run_once(agent: NLQAgent, question: str, show_sql_only: bool) -> int:
-    """One-shot mode is scriptable, so failure must be visible in the exit code."""
+    """One-shot mode is scriptable, so failure shows in the exit code."""
     result = agent.ask(question)
     render(result, show_sql_only)
     return 0 if result.ok else 1

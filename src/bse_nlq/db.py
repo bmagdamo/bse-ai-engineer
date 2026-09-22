@@ -8,20 +8,15 @@ Three independent layers keep a generated query from doing damage:
    blocks ATTACH, PRAGMA, and writes inside the engine itself.
 3. guards.validate() parses the SQL first, purely so failures are explainable.
 
-Connections are **per thread** (`threading.local`). A single shared connection
-was both a correctness and a performance bug under Streamlit, which serves
-every session from one cached `Database`:
+Connections are **per thread**. Streamlit serves every session from one cached
+`Database`, and `set_authorizer` is per-connection state: on a shared
+connection one thread's `finally` could clear the authorizer while another was
+mid-query, disabling layer 2 for that query. Sharing also turned 120
+concurrent COUNT(*) queries from 0.35s into >140s.
 
-* `set_authorizer` and `set_progress_handler` are per-connection global state,
-  so one thread's `finally` could clear the authorizer while another thread was
-  mid-query -- disabling layer 2 for that query.
-* Contention on the shared connection turned 120 concurrent `COUNT(*)` queries
-  from 0.35s into >140s.
-
-The query timeout uses `Connection.interrupt()` driven by a timer rather than a
-Python progress handler. `interrupt()` is designed to be called from another
-thread, and it keeps a Python callback out of a loop that runs every few
-thousand VM instructions.
+The query timeout uses `Connection.interrupt()` from a timer thread rather
+than a progress handler: interrupt() is designed for cross-thread use and
+keeps a Python callback out of a loop that runs every few thousand opcodes.
 """
 
 from __future__ import annotations
@@ -30,6 +25,7 @@ import logging
 import sqlite3
 import threading
 import time
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -37,11 +33,15 @@ from bse_nlq.errors import ConfigError, QueryExecutionError, QueryTimeoutError
 
 log = logging.getLogger(__name__)
 
-# Actions the agent is allowed to perform. Everything else is denied.
+# Everything not listed is denied. SQLITE_RECURSIVE is the step a WITH
+# RECURSIVE CTE takes; without it the engine answers a bare "not authorized"
+# and the agent burns its repair attempt on SQL that was never wrong. It reads
+# no data itself -- reads inside the CTE still go through SQLITE_READ.
 _ALLOWED_ACTIONS = {
     sqlite3.SQLITE_SELECT,
     sqlite3.SQLITE_READ,
     sqlite3.SQLITE_FUNCTION,
+    sqlite3.SQLITE_RECURSIVE,
 }
 
 
@@ -88,14 +88,13 @@ class Database:
                 f"Database not found at {self.path}. Build it first: "
                 "uv run python data/seed.py"
             )
-        # One connection per thread. No check_same_thread=False: each
-        # connection is only ever touched by the thread that opened it, so we
-        # *want* sqlite3 to flag any cross-thread misuse.
+        # No check_same_thread=False: each connection is only ever touched by
+        # the thread that opened it, so we *want* sqlite3 to flag misuse.
         self._local = threading.local()
         self._lock = threading.Lock()
-        # (owning thread, connection). The thread is retained so dead entries
-        # can be pruned: Streamlit starts a new script-runner thread per rerun,
-        # so an append-only list would leak a file handle per interaction.
+        # (owning thread, connection). The thread is kept so dead entries can
+        # be pruned: Streamlit starts a script-runner thread per rerun, so an
+        # append-only list would leak a file handle per interaction.
         self._connections: list[tuple[threading.Thread, sqlite3.Connection]] = []
         self._conn  # fail fast if the file is unreadable  # noqa: B018
 
@@ -108,44 +107,36 @@ class Database:
             with self._lock:
                 self._prune_locked()
                 self._connections.append((threading.current_thread(), conn))
-                live = len(self._connections)
-            log.debug("Opened read-only connection on thread %s (%d live)",
-                      threading.current_thread().name, live)
+            log.debug("Opened read-only connection on thread %s",
+                      threading.current_thread().name)
         return conn
 
     def _prune_locked(self) -> None:
         """Drop connections whose owning thread has exited.
 
-        The references are simply released rather than closed: a sqlite3
-        connection cannot be closed from a thread other than its owner, and
-        CPython finalises it as soon as the last reference goes away.
+        References are released rather than closed: a sqlite3 connection
+        cannot be closed from another thread, and CPython finalises it as soon
+        as the last reference goes away.
         """
-        before = len(self._connections)
         self._connections = [
             (thread, conn) for thread, conn in self._connections if thread.is_alive()
         ]
-        if before != len(self._connections):
-            log.debug("Pruned %d connection(s) from dead threads",
-                      before - len(self._connections))
 
     @property
     def live_connections(self) -> int:
-        """Connections currently held open. Exposed for tests and diagnostics."""
+        """Connections currently held open. For tests and diagnostics."""
         with self._lock:
             self._prune_locked()
             return len(self._connections)
 
     def close(self) -> None:
-        """Close every connection this Database opened, on any thread."""
+        """Close this thread's connections; release the rest to finalisation."""
         with self._lock:
             connections, self._connections = self._connections, []
         for thread, conn in connections:
-            if thread is not threading.current_thread():
-                continue   # not ours to close; releasing the reference finalises it
-            try:
-                conn.close()
-            except sqlite3.Error:
-                log.debug("Connection already closed")
+            if thread is threading.current_thread():
+                with suppress(sqlite3.Error):
+                    conn.close()
         self._local = threading.local()
 
     def __enter__(self) -> Database:
@@ -166,8 +157,8 @@ class Database:
             conn.interrupt()      # thread-safe by design; aborts the running query
 
         # The authorizer is scoped to this call because introspection needs
-        # PRAGMA, which the authorizer denies. That scoping is only safe
-        # because the connection belongs to this thread alone.
+        # PRAGMA, which it denies. That scoping is only safe because the
+        # connection belongs to this thread alone.
         conn.set_authorizer(_authorizer)
         watchdog = threading.Timer(self.timeout_seconds, _abort)
         watchdog.daemon = True
@@ -179,8 +170,6 @@ class Database:
             columns = [d[0] for d in cursor.description] if cursor.description else []
         except sqlite3.Error as exc:
             if timed_out.is_set():
-                log.warning("Query exceeded %.0fs and was aborted: %s",
-                            self.timeout_seconds, sql.replace("\n", " ")[:200])
                 raise QueryTimeoutError(
                     f"The query took longer than {self.timeout_seconds:.0f}s and was "
                     "stopped. Try narrowing the question to a shorter time range."
@@ -193,14 +182,17 @@ class Database:
             watchdog.cancel()
             conn.set_authorizer(None)
 
-        truncated = len(rows) > self.max_rows
         elapsed = time.monotonic() - started
         if elapsed > 1.0:
             log.info("Slow query: %.2fs for %s", elapsed, sql.replace("\n", " ")[:120])
+        # The extra row above the cap exists only to detect truncation. It
+        # cannot fire when the caller already capped the SQL at exactly
+        # max_rows (guards.enforce_limit does), so the agent reconstructs the
+        # flag itself -- see NLQAgent._capped.
         return QueryResult(
             columns=columns,
             rows=rows[: self.max_rows],
-            truncated=truncated,
+            truncated=len(rows) > self.max_rows,
             elapsed_seconds=elapsed,
         )
 
@@ -215,18 +207,21 @@ class Database:
                 "AND name NOT LIKE 'sqlite_%' ORDER BY name"
             )
         ]
-        out = []
-        for name in names:
-            cols = [
-                ColumnInfo(name=r[1], type=r[2] or "TEXT", nullable=not r[3], primary_key=bool(r[5]))
-                for r in self._conn.execute(f"PRAGMA table_info('{name}')")
-            ]
-            fks = [
-                (r[3], r[2], r[4])
-                for r in self._conn.execute(f"PRAGMA foreign_key_list('{name}')")
-            ]
-            out.append(TableInfo(name=name, columns=cols, foreign_keys=fks))
-        return out
+        return [
+            TableInfo(
+                name=name,
+                columns=[
+                    ColumnInfo(name=r[1], type=r[2] or "TEXT",
+                               nullable=not r[3], primary_key=bool(r[5]))
+                    for r in self._conn.execute(f"PRAGMA table_info('{name}')")
+                ],
+                foreign_keys=[
+                    (r[3], r[2], r[4])
+                    for r in self._conn.execute(f"PRAGMA foreign_key_list('{name}')")
+                ],
+            )
+            for name in names
+        ]
 
     def distinct_values(self, table: str, column: str, limit: int = 25) -> list[str]:
         """Sample distinct values for a low-cardinality column (prompt value hints)."""
