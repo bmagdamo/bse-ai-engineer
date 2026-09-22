@@ -157,9 +157,13 @@ class NLQAgent:
         hit; `prompt_version` is the handle on *which* prompt that was, so a
         cached answer and an audit line both name the revision behind them.
         """
-        self.schema_fingerprint = schema_context.fingerprint(self.db)
+        # Introspected once and shared: db.tables() is a PRAGMA round-trip per
+        # table, and the fingerprint and the rendered context want the same
+        # snapshot anyway.
+        tables = self.db.tables()
+        self.schema_fingerprint = schema_context.fingerprint(self.db, tables)
         self.system_prompt = prompts.build_system_prompt(
-            schema_context.build_schema_context(self.db),
+            schema_context.build_schema_context(self.db, tables),
             self.settings.restricted_column_names,
         )
         self.prompt_version = cache.key_for(self.system_prompt)[:12]

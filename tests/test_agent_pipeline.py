@@ -344,7 +344,8 @@ def test_a_changed_schema_rebuilds_the_prompt_and_drops_cached_answers(db, monke
     assert len(agent.cache) == 1
     before = agent.schema_fingerprint
 
-    monkeypatch.setattr("bse_nlq.schema_context.fingerprint", lambda _db: "migrated")
+    monkeypatch.setattr("bse_nlq.schema_context.fingerprint",
+                        lambda _db, _tables=None: "migrated")
     assert not agent.ask("q").cached, "the pre-migration answer must not be served"
     assert agent.schema_fingerprint == "migrated" != before
 
@@ -353,7 +354,8 @@ def test_the_schema_check_can_be_switched_off(db, monkeypatch):
     agent = NLQAgent(db, Settings(schema_check_interval_seconds=0),
                      client=FakeModelClient(plan("SELECT 1 AS n"), "ok"))
     before = agent.schema_fingerprint
-    monkeypatch.setattr("bse_nlq.schema_context.fingerprint", lambda _db: "migrated")
+    monkeypatch.setattr("bse_nlq.schema_context.fingerprint",
+                        lambda _db, _tables=None: "migrated")
     agent.ask("q")
     assert agent.schema_fingerprint == before
 

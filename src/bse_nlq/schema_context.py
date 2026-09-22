@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import hashlib
 
-from bse_nlq.db import Database
+from bse_nlq.db import Database, TableInfo
 from bse_nlq.errors import ConfigError
 
 # Columns whose full value set is small enough to enumerate in the prompt.
@@ -28,10 +28,15 @@ VALUE_HINT_COLUMNS: list[tuple[str, str]] = [
 ]
 
 
-def render_schema(db: Database) -> str:
-    """A compact CREATE-TABLE-style rendering of every table."""
+def render_schema(db: Database, tables: list[TableInfo] | None = None) -> str:
+    """A compact CREATE-TABLE-style rendering of every table.
+
+    `tables` is accepted so one caller can introspect once and reuse the
+    result; db.tables() is a PRAGMA per table and nothing memoizes it,
+    deliberately, because drift detection depends on reading it fresh.
+    """
     blocks = []
-    for table in db.tables():
+    for table in tables if tables is not None else db.tables():
         lines = [f"TABLE {table.name} ({db.row_count(table.name):,} rows)"]
         for col in table.columns:
             flags = []
@@ -47,7 +52,7 @@ def render_schema(db: Database) -> str:
     return "\n\n".join(blocks)
 
 
-def render_value_hints(db: Database) -> str:
+def render_value_hints(db: Database, tables: list[TableInfo] | None = None) -> str:
     """Enumerate the allowed literals for low-cardinality columns.
 
     VALUE_HINT_COLUMNS is hand-picked, not auto-detected: probing every text
@@ -55,7 +60,8 @@ def render_value_hints(db: Database) -> str:
     cost is that the list can drift, so it is checked against the live schema
     here -- a stale entry fails loudly rather than silently dropping a hint.
     """
-    known = {table.name: {c.name for c in table.columns} for table in db.tables()}
+    known = {table.name: {c.name for c in table.columns}
+             for table in (tables if tables is not None else db.tables())}
     missing = [
         f"{table}.{column}"
         for table, column in VALUE_HINT_COLUMNS
@@ -87,7 +93,7 @@ def render_date_range(db: Database) -> str:
     return f"{lo} to {hi}"
 
 
-def fingerprint(db: Database) -> str:
+def fingerprint(db: Database, tables: list[TableInfo] | None = None) -> str:
     """A short digest of the schema's *structure*: tables, columns, keys.
 
     Deliberately not built from `build_schema_context`, which counts rows --
@@ -98,21 +104,22 @@ def fingerprint(db: Database) -> str:
     exists.
     """
     parts = []
-    for table in db.tables():
+    for table in tables if tables is not None else db.tables():
         columns = ",".join(f"{c.name}:{c.type}:{int(c.nullable)}" for c in table.columns)
         keys = ",".join(f"{c}->{t}.{r}" for c, t, r in table.foreign_keys)
         parts.append(f"{table.name}({columns})[{keys}]")
     return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:12]
 
 
-def build_schema_context(db: Database) -> str:
+def build_schema_context(db: Database, tables: list[TableInfo] | None = None) -> str:
     """The full, byte-stable schema block injected into the system prompt."""
+    tables = tables if tables is not None else db.tables()
     return (
         "## Database schema (SQLite)\n\n"
-        f"{render_schema(db)}\n\n"
+        f"{render_schema(db, tables)}\n\n"
         "## Allowed values for low-cardinality columns\n\n"
         "Use these literals exactly -- do not guess variants.\n\n"
-        f"{render_value_hints(db)}\n\n"
+        f"{render_value_hints(db, tables)}\n\n"
         "## Data coverage\n\n"
         f"  events.event_date spans {render_date_range(db)}.\n"
         "  Questions about dates outside this range will correctly return no rows.\n"

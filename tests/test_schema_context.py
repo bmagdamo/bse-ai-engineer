@@ -59,6 +59,22 @@ def test_todays_date_lives_in_the_user_turn():
 
 
 
+def test_a_prompt_build_introspects_the_schema_once(db, monkeypatch):
+    """db.tables() is a PRAGMA round-trip per table and is deliberately not
+    memoized, so the fingerprint and the rendered context have to share one
+    snapshot rather than each fetching their own."""
+    from bse_nlq.agent import NLQAgent
+    from bse_nlq.config import SETTINGS
+    from tests.fakes import FakeModelClient
+
+    calls = []
+    original = type(db).tables
+    monkeypatch.setattr(type(db), "tables",
+                        lambda self: (calls.append(1), original(self))[1])
+    NLQAgent(db, SETTINGS, client=FakeModelClient())
+    assert len(calls) == 1
+
+
 def test_prompt_forbids_the_utc_now_helper():
     """The regression this guards: the prompt used to hand the model
     date('now'), which SQLite evaluates in UTC, while telling it today's date
