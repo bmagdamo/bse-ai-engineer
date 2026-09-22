@@ -4,6 +4,11 @@ on:
   push:
     branches: [main, master]
   pull_request:
+  schedule:
+    # Weekly, so a change on the model's side shows up as a failing eval
+    # rather than as a user reporting a wrong number.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
 
 jobs:
   test:
@@ -28,5 +33,40 @@ jobs:
 
       - name: Test
         # The `llm` marker is excluded: those tests make real API calls. They
-        # run locally with a key (see README) and are not gated on in CI.
+        # run in the `eval` job below, which has the key.
         run: uv run pytest -m "not llm" -q
+
+  eval:
+    # NLQ accuracy is a release gate, not a per-commit one: it makes real API
+    # calls, and secrets are not available to pull requests from forks. Runs on
+    # main, weekly, and on demand.
+    name: NLQ accuracy eval
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --extra dev
+
+      - name: Build the database
+        # Anchored on today, unlike the unit-test job: the gold SQL resolves
+        # <TODAY> against the business calendar, so a database anchored in the
+        # past would make every "last month" case compare zero against zero
+        # and pass without testing anything.
+        run: uv run python data/seed.py
+
+      - name: Run the eval
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "::warning::ANTHROPIC_API_KEY is not configured; accuracy was not measured."
+            exit 0
+          fi
+          uv run pytest -m llm -v
