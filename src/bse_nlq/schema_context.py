@@ -9,6 +9,8 @@ literal like 'complete'.
 
 from __future__ import annotations
 
+import hashlib
+
 from bse_nlq.db import Database
 from bse_nlq.errors import ConfigError
 
@@ -83,6 +85,24 @@ def render_date_range(db: Database) -> str:
         return "unknown"
     lo, hi = result.rows[0]
     return f"{lo} to {hi}"
+
+
+def fingerprint(db: Database) -> str:
+    """A short digest of the schema's *structure*: tables, columns, keys.
+
+    Deliberately not built from `build_schema_context`, which counts rows --
+    a full scan per table, and a digest that changes on every insert would
+    report drift for data that is merely fresh. This reads PRAGMA only, so a
+    long-lived process can afford to re-check it and notice a migration that
+    would otherwise leave its prompt describing a schema that no longer
+    exists.
+    """
+    parts = []
+    for table in db.tables():
+        columns = ",".join(f"{c.name}:{c.type}:{int(c.nullable)}" for c in table.columns)
+        keys = ",".join(f"{c}->{t}.{r}" for c, t, r in table.foreign_keys)
+        parts.append(f"{table.name}({columns})[{keys}]")
+    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:12]
 
 
 def build_schema_context(db: Database) -> str:

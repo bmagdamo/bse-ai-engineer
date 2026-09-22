@@ -102,6 +102,18 @@ class Settings:
     # retried, can stack into minutes. See deadline.Deadline.
     total_deadline_seconds: float = 120.0
 
+    # --- caching -------------------------------------------------------
+    # Repeat questions are the common case on a shared dashboard. The key
+    # includes the business date and a schema fingerprint, so a relative
+    # window cannot be served from yesterday. Either value at 0 disables it.
+    cache_ttl_seconds: float = 300.0
+    cache_max_entries: int = 128
+    # How often a long-lived process re-checks the schema behind its prompt.
+    # Streamlit caches one agent for the life of the process, so without this
+    # a migration leaves the prompt describing a schema that no longer exists.
+    # 0 disables the check.
+    schema_check_interval_seconds: float = 300.0
+
     # --- governance ----------------------------------------------------
     # Columns no generated query may read, comma-separated. Enforced in the
     # guard (see guards.restricted_columns) and declared in the prompt, so the
@@ -188,7 +200,8 @@ class Settings:
 _FLOORS = {
     "max_rows": 1, "max_attempts": 1, "max_repair_attempts": 0,
     "query_timeout_seconds": 0, "sql_max_tokens": 1, "answer_max_tokens": 1,
-    "total_deadline_seconds": 1, "breaker_failure_threshold": 1,
+    "total_deadline_seconds": 1, "cache_ttl_seconds": 0, "cache_max_entries": 0,
+    "schema_check_interval_seconds": 0, "breaker_failure_threshold": 1,
     "breaker_cooldown_seconds": 0,
 }
 
