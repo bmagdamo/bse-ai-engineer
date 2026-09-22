@@ -82,6 +82,17 @@ class Settings:
     retry_after_max_seconds: float = 60.0
     request_timeout_seconds: float = 120.0
 
+    # A second model to fall through to when the primary is rate limited or
+    # down. Empty disables it. The point is a cheaper/steadier model taking
+    # over during an incident rather than every user seeing a failure; see
+    # claude.FallbackClient.
+    fallback_model: str = ""
+    # Consecutive transient failures that trip a model out of rotation, and
+    # how long it stays out. Without this every request keeps paying the full
+    # retry budget against an endpoint already known to be down.
+    breaker_failure_threshold: int = 3
+    breaker_cooldown_seconds: float = 30.0
+
     # --- agent ---------------------------------------------------------
     # One repair attempt: enough to fix a mistyped column, not enough to burn
     # budget looping on a fundamentally wrong query.
@@ -156,7 +167,8 @@ class Settings:
 _FLOORS = {
     "max_rows": 1, "max_attempts": 1, "max_repair_attempts": 0,
     "query_timeout_seconds": 0, "sql_max_tokens": 1, "answer_max_tokens": 1,
-    "total_deadline_seconds": 1,
+    "total_deadline_seconds": 1, "breaker_failure_threshold": 1,
+    "breaker_cooldown_seconds": 0,
 }
 
 #: field -> caster, derived from the annotations so the two cannot drift.

@@ -9,6 +9,8 @@ testable without network access and confines an SDK change to this file.
 from __future__ import annotations
 
 import logging
+import threading
+import time
 from dataclasses import dataclass, replace
 from typing import Protocol, runtime_checkable
 
@@ -298,3 +300,104 @@ class ClaudeClient:
         except (TypeError, ValueError):
             return None
 
+
+class _Breaker:
+    """Trips a client out of rotation after consecutive transient failures.
+
+    Retrying is the right response to one bad call and the wrong response to a
+    dead endpoint: every request then pays the full backoff budget before
+    failing the same way. The breaker turns the second case into an immediate
+    skip, and closes itself again after a cooldown rather than needing a
+    probe -- the next request through is the probe.
+    """
+
+    def __init__(self, threshold: int, cooldown_seconds: float):
+        self.threshold = threshold
+        self.cooldown_seconds = cooldown_seconds
+        self._failures = 0
+        self._opened_at = 0.0
+        self._lock = threading.Lock()
+
+    @property
+    def open(self) -> bool:
+        """True while the client is out of rotation."""
+        with self._lock:
+            if self._failures < self.threshold:
+                return False
+            if time.monotonic() - self._opened_at >= self.cooldown_seconds:
+                self._failures = 0      # cooled down: let the next call probe
+                return False
+            return True
+
+    def record_success(self) -> None:
+        with self._lock:
+            self._failures = 0
+
+    def record_failure(self) -> None:
+        with self._lock:
+            self._failures += 1
+            if self._failures == self.threshold:
+                self._opened_at = time.monotonic()
+                log.warning("Model circuit opened for %.0fs after %d failures",
+                            self.cooldown_seconds, self._failures)
+
+
+class FallbackClient:
+    """Tries each client in order, skipping any whose circuit is open.
+
+    Composes `ModelClient`s rather than extending one, so the fallback is
+    itself a `ModelClient` and the agent cannot tell the difference. Adding a
+    third model, or a Bedrock-backed one, is another constructor argument.
+
+    Only transient failures fall through. A bad API key or an unknown model is
+    not an outage and would fail identically on every client, so it propagates
+    at once instead of being retried across the whole roster.
+    """
+
+    def __init__(self, *clients: ModelClient, settings: Settings = SETTINGS):
+        if not clients:
+            raise ValueError("FallbackClient needs at least one client")
+        self._clients = [
+            (client, _Breaker(settings.breaker_failure_threshold,
+                              settings.breaker_cooldown_seconds))
+            for client in clients
+        ]
+
+    def complete(self, request: ModelRequest) -> ModelResponse:
+        last: TransientModelError | None = None
+        for client, breaker in self._clients:
+            if breaker.open:
+                continue
+            try:
+                response = client.complete(request)
+            except TransientModelError as exc:
+                breaker.record_failure()
+                last = exc
+                log.warning("Model unavailable (%s); trying the next one", exc)
+                continue
+            breaker.record_success()
+            return response
+
+        if last is not None:
+            raise last
+        raise ModelError(
+            "Every configured model is temporarily unavailable. Try again shortly."
+        )
+
+
+def build_client(settings: Settings = SETTINGS) -> ModelClient:
+    """The client the agent should use for these settings.
+
+    A single `ClaudeClient` unless a fallback model is configured, so the
+    default path stays exactly as simple as it was and resilience is one
+    environment variable away.
+    """
+    primary = ClaudeClient(settings.model, settings=settings)
+    if not settings.fallback_model.strip():
+        return primary
+    log.info("Fallback model configured: %s", settings.fallback_model)
+    return FallbackClient(
+        primary,
+        ClaudeClient(settings.fallback_model, settings=settings),
+        settings=settings,
+    )
