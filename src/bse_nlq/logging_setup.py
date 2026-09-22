@@ -24,8 +24,11 @@ _NOISY_LOGGERS = ("httpx", "httpx2", "httpcore", "httpcore2", "anthropic")
 
 
 def resolve_level(verbose: bool = False) -> int:
-    """NLQ_LOG_LEVEL wins; otherwise --verbose means INFO and the default is
-    WARNING, so a normal run stays quiet."""
+    """--verbose wins, then NLQ_LOG_LEVEL, then WARNING.
+
+    An explicit flag beats an ambient environment variable: someone who typed
+    -v is asking for detail now, and should not have to notice that a shell
+    export is quietly holding the level down."""
     if verbose:
         return logging.DEBUG
     name = os.getenv("NLQ_LOG_LEVEL", "").strip().upper()

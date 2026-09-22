@@ -65,7 +65,7 @@ class Settings:
     # to the model as a literal date, because SQLite's date('now') is UTC and
     # would disagree with it for part of every day. See prompts.DATE_RECIPES.
     timezone: str = "America/New_York"
-    # Aggregates over ~2.4M ticket rows take a couple of seconds; this is a
+    # Aggregates over ~850k ticket rows take a second or two; this is a
     # runaway-query backstop, not a latency target.
     query_timeout_seconds: float = 20.0
 
