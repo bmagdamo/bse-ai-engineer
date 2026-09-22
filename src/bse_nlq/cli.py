@@ -77,8 +77,18 @@ def _render_footer(result: NLQResult) -> None:
         console.print("\n[bold]Assumptions[/bold]")
         for item in result.assumptions:
             console.print(f"  [dim]•[/dim] {escape(item)}")
+    # The trace line is what a user quotes when reporting a bad answer: the
+    # request id finds the audit record, which holds the SQL and the prompt
+    # revision behind it.
+    trace = []
+    if result.request_id:
+        trace.append(f"request {result.request_id}")
+    if result.cached:
+        trace.append("served from cache")
     if result.usage.calls:
-        console.print(f"\n[dim]{escape(result.usage.summary())}[/dim]")
+        trace.append(result.usage.summary())
+    if trace:
+        console.print(f"\n[dim]{escape(' · '.join(trace))}[/dim]")
     console.print()
 
 

@@ -249,3 +249,168 @@ def test_todays_date_is_resolved_in_the_business_timezone(db):
     turn = agent.client.requests[0].messages[0].content
     assert expected in turn
     assert "Pacific/Kiritimati" in turn
+
+
+# --- provenance -------------------------------------------------------------
+
+def test_every_answer_carries_the_model_and_prompt_that_produced_it(db):
+    agent = make_agent(db, plan("SELECT 1 AS n"), "ok")
+    result = agent.ask("anything")
+    assert result.model == SETTINGS.model
+    assert result.prompt_version == agent.prompt_version
+    assert len(result.request_id) == 12
+    assert result.total_seconds > 0
+
+
+def test_each_question_gets_its_own_correlation_id(db):
+    agent = make_agent(db, plan("SELECT 1 AS n"), "ok", plan("SELECT 2 AS n"), "ok")
+    first = agent.ask("one")
+    second = agent.ask("two")
+    assert first.request_id != second.request_id
+
+
+def test_an_empty_question_is_still_traceable(db):
+    assert make_agent(db).ask("   ").request_id
+
+
+# --- the repeat-question cache ---------------------------------------------
+
+def test_an_identical_question_is_served_without_calling_the_model(db):
+    agent = make_agent(db, plan("SELECT COUNT(*) AS n FROM venues"), "There are 2 venues.")
+    first = agent.ask("How many venues are there?")
+    second = agent.ask("How many venues are there?")   # no payloads left to serve
+
+    assert second.answer == first.answer
+    assert second.rows == first.rows
+    assert second.cached and not first.cached
+    assert len(agent.client.requests) == 2, "the model was not called a second time"
+
+
+def test_the_cache_is_case_insensitive_but_not_question_blind(db):
+    agent = make_agent(db, plan("SELECT 1 AS n"), "ok", plan("SELECT 2 AS n"), "ok")
+    agent.ask("How many venues?")
+    assert agent.ask("HOW MANY VENUES?").cached
+    assert not agent.ask("How many events?").cached, "a different question is a miss"
+
+
+def test_a_cached_answer_still_gets_a_fresh_request_id(db):
+    agent = make_agent(db, plan("SELECT 1 AS n"), "ok")
+    first = agent.ask("q")
+    second = agent.ask("q")
+    assert second.cached
+    assert second.request_id != first.request_id, "each request is its own audit event"
+
+
+def test_failures_are_never_cached(db):
+    """Replaying a failure would hide a transient outage behind a stale error
+    for the whole TTL."""
+    agent = make_agent(db, ModelError("API is down"),
+                       plan("SELECT 1 AS n"), "recovered")
+    assert agent.ask("q").outcome is Outcome.FAILED
+    assert agent.ask("q").answer == "recovered"
+
+
+def test_caching_can_be_switched_off(db):
+    settings = Settings(cache_ttl_seconds=0)
+    agent = NLQAgent(db, settings, client=FakeModelClient(
+        plan("SELECT 1 AS n"), "ok", plan("SELECT 1 AS n"), "ok"))
+    agent.ask("q")
+    assert not agent.ask("q").cached
+    assert len(agent.client.requests) == 4
+
+
+# --- schema drift -----------------------------------------------------------
+
+def test_a_changed_schema_rebuilds_the_prompt_and_drops_cached_answers(db, monkeypatch):
+    """Streamlit caches one agent for the life of the process, so a migration
+    must not leave it answering from a schema it no longer describes."""
+    settings = Settings(schema_check_interval_seconds=0.001)
+    agent = NLQAgent(db, settings, client=FakeModelClient(
+        plan("SELECT 1 AS n"), "ok", plan("SELECT 1 AS n"), "ok"))
+    agent.ask("q")
+    assert len(agent.cache) == 1
+    before = agent.schema_fingerprint
+
+    monkeypatch.setattr("bse_nlq.schema_context.fingerprint", lambda _db: "migrated")
+    assert not agent.ask("q").cached, "the pre-migration answer must not be served"
+    assert agent.schema_fingerprint == "migrated" != before
+
+
+def test_the_schema_check_can_be_switched_off(db, monkeypatch):
+    agent = NLQAgent(db, Settings(schema_check_interval_seconds=0),
+                     client=FakeModelClient(plan("SELECT 1 AS n"), "ok"))
+    before = agent.schema_fingerprint
+    monkeypatch.setattr("bse_nlq.schema_context.fingerprint", lambda _db: "migrated")
+    agent.ask("q")
+    assert agent.schema_fingerprint == before
+
+
+# --- the end-to-end deadline ------------------------------------------------
+
+def test_an_exhausted_budget_fails_cleanly_before_calling_the_model(db, monkeypatch):
+    from bse_nlq.deadline import Deadline
+
+    monkeypatch.setattr(Deadline, "after", classmethod(lambda cls, _s: cls(0.0)))
+    agent = make_agent(db, plan("SELECT 1 AS n"), "ok")
+    result = agent.ask("q")
+
+    assert result.outcome is Outcome.FAILED
+    assert "too long" in result.answer
+    assert agent.client.requests == [], "no budget left means no call is started"
+
+
+def test_the_deadline_travels_with_the_request(db):
+    agent = make_agent(db, plan("SELECT 1 AS n"), "ok")
+    agent.ask("q")
+    assert all(r.deadline is not None for r in agent.client.requests), (
+        "both the planning and the synthesis call share one budget"
+    )
+
+
+# --- audit ------------------------------------------------------------------
+
+def test_every_question_is_audited(db, tmp_path):
+    import json
+
+    from bse_nlq.observability import AuditLog
+
+    path = tmp_path / "audit.jsonl"
+    agent = NLQAgent(db, SETTINGS, client=FakeModelClient(
+        plan("SELECT COUNT(*) AS n FROM venues"), "There are 2 venues.",
+        declined("No marketing data.")), audit=AuditLog(path))
+    agent.ask("How many venues?")
+    agent.ask("How many venues?")          # a cache hit is still an audit event
+    agent.ask("Which campaign won?")
+
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    assert [r["outcome"] for r in records] == ["answered", "answered", "declined"]
+    assert [r["cached"] for r in records] == [False, True, False]
+    assert len({r["request_id"] for r in records}) == 3
+
+
+# --- column-level access control, end to end --------------------------------
+
+def test_a_restricted_column_is_blocked_before_the_query_runs(db):
+    agent = NLQAgent(db, Settings(restricted_columns="email"),
+                     client=FakeModelClient(plan("SELECT email FROM customers")))
+    result = agent.ask("List every customer email")
+
+    assert result.outcome is Outcome.FAILED
+    assert "restricted" in result.answer
+    assert len(agent.client.requests) == 1, "no synthesis call on blocked SQL"
+
+
+def test_the_model_is_told_which_columns_are_restricted(db):
+    agent = NLQAgent(db, Settings(restricted_columns="email"),
+                     client=FakeModelClient(plan("SELECT 1 AS n"), "ok"))
+    assert "Restricted columns" in agent.system_prompt
+    assert "email" in agent.system_prompt
+    assert "Restricted columns" not in make_agent(db).system_prompt
+
+
+def test_a_cache_hit_reports_no_cost(db):
+    """A cost dashboard sums these fields; a hit that inherited the original
+    usage would bill every repeat for calls that never happened."""
+    agent = make_agent(db, plan("SELECT 1 AS n"), "ok")
+    agent.ask("q")
+    assert agent.ask("q").usage.calls == 0

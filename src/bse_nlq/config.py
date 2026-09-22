@@ -66,7 +66,8 @@ class Settings:
     # would disagree with it for part of every day. See prompts.DATE_RECIPES.
     timezone: str = "America/New_York"
     # Aggregates over ~850k ticket rows take a second or two; this is a
-    # runaway-query backstop, not a latency target.
+    # runaway-query backstop, not a latency target. Lowered per query to
+    # whatever the question's end-to-end deadline has left.
     query_timeout_seconds: float = 20.0
 
     # --- retries -------------------------------------------------------
@@ -125,6 +126,8 @@ class Settings:
     # rather than guessed. Turning it on also bans SELECT *, which would
     # otherwise be the way around it.
     restricted_columns: str = ""
+    # Append-only JSONL trail of every question. Unset means log-only.
+    audit_log_path: Path | None = None
 
     @classmethod
     def from_env(cls, **overrides) -> Settings:
@@ -209,7 +212,9 @@ _FLOORS = {
 #: `f.type` is the annotation *string* because of `from __future__ import
 #: annotations`. A field of a new type raises KeyError here at import, which
 #: is the point: adding one forces a decision about how to parse it.
-_TYPES = {"str": str, "int": int, "float": float, "Path": Path}
+#: An optional field casts with the same callable: from_env only reaches a
+#: caster for a variable that is set and non-empty, so None is never parsed.
+_TYPES = {"str": str, "int": int, "float": float, "Path": Path, "Path | None": Path}
 _CASTERS = {f.name: _TYPES[f.type] for f in fields(Settings)}
 
 #: Process-wide settings, resolved once from the environment at import.

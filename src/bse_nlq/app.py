@@ -74,5 +74,9 @@ if question:
             for item in result.assumptions:
                 st.markdown(f"- {item}")
 
+    trace = [f"request `{result.request_id}`"]
+    if result.cached:
+        trace.append("served from cache")
     if result.usage.calls:
-        st.caption(result.usage.summary())
+        trace.append(result.usage.summary())
+    st.caption(" · ".join(trace))

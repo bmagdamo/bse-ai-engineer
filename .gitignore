@@ -16,6 +16,8 @@ wheels/
 .env.*
 !.env.example
 data/*.db
+# The audit trail is written at runtime and holds real questions.
+data/*.jsonl
 .pytest_cache/
 .ruff_cache/
 

@@ -8,23 +8,31 @@ Synthesis is a separate, cheaper call that never sees the schema.
 
 The agent depends on the `ModelClient` protocol, not on `anthropic`, so the
 whole pipeline is exercisable in tests without network access.
+
+Around that pipeline sit the concerns a long-running deployment needs, each
+owned by its own module so `ask()` stays a readable sequence: a correlation id
+and audit record per question (`observability`), one end-to-end budget every
+stage checks (`deadline`), a repeat-question cache (`cache`), and a schema
+fingerprint that rebuilds the prompt when the database changes underneath it.
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+import time
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import StrEnum
 from zoneinfo import ZoneInfo
 
-from bse_nlq import formatter, guards, prompts
-from bse_nlq.claude import ClaudeClient, Message, ModelClient, ModelRequest, TokenUsage
+from bse_nlq import cache, formatter, guards, observability, prompts, schema_context
+from bse_nlq.claude import Message, ModelClient, ModelRequest, TokenUsage, build_client
 from bse_nlq.config import SETTINGS, Settings
 from bse_nlq.db import Database, QueryResult
+from bse_nlq.deadline import Deadline
 from bse_nlq.errors import ModelError, NLQError, QueryExecutionError
 from bse_nlq.models import SqlPlan
-from bse_nlq.schema_context import build_schema_context
+from bse_nlq.observability import AuditLog
 
 log = logging.getLogger(__name__)
 
@@ -70,8 +78,16 @@ class NLQResult:
     rows: tuple[tuple, ...] = ()
     attempts: tuple[Attempt, ...] = ()
     truncated: bool = False
-    elapsed_seconds: float = 0.0
+    elapsed_seconds: float = 0.0        # the SQL query alone
+    total_seconds: float = 0.0          # the whole question, end to end
     usage: TokenUsage = TokenUsage()
+    # Provenance: enough to attribute an answer to the exact model and prompt
+    # that produced it, which is what makes an accuracy regression traceable
+    # to a release rather than to a guess.
+    request_id: str = ""
+    model: str = ""
+    prompt_version: str = ""
+    cached: bool = False
 
     @property
     def ok(self) -> bool:
@@ -101,21 +117,48 @@ class _Run:
 
     question: str
     request: ModelRequest
+    deadline: Deadline
     usage: TokenUsage = TokenUsage()
     attempts: list[Attempt] = field(default_factory=list)
 
 
 class NLQAgent:
-    """Stateless across questions -- each ask() is an independent turn."""
+    """Stateless across questions -- each ask() is an independent turn.
+
+    The cache, the audit sink and the circuit breakers are per agent, not per
+    question: one agent is constructed per process (Streamlit caches it, the
+    CLI holds one for the session) and shared across threads.
+    """
 
     def __init__(self, db: Database, settings: Settings = SETTINGS,
-                 client: ModelClient | None = None):
+                 client: ModelClient | None = None,
+                 audit: AuditLog | None = None):
         self.db = db
         self.settings = settings
-        self.client = client or ClaudeClient(settings.model, settings=settings)
-        # Built once, and byte-identical between questions: that is what makes
-        # the prompt cache hit.
-        self.system_prompt = prompts.build_system_prompt(build_schema_context(db))
+        self.client = client or build_client(settings)
+        self.audit = audit or AuditLog(settings.audit_log_path)
+        self.cache: cache.TTLCache[NLQResult] = cache.TTLCache(
+            settings.cache_max_entries, settings.cache_ttl_seconds
+        )
+        # The access policy is resolved once: the baseline rules plus, when
+        # columns are restricted, the rule that enforces that.
+        self.rules = guards.policy_for(settings.restricted_column_names)
+        self._schema_checked_at = time.monotonic()
+        self._build_prompt()
+
+    def _build_prompt(self) -> None:
+        """(Re)build the system prompt from the live schema.
+
+        Byte-identical between questions, which is what makes the prompt cache
+        hit; `prompt_version` is the handle on *which* prompt that was, so a
+        cached answer and an audit line both name the revision behind them.
+        """
+        self.schema_fingerprint = schema_context.fingerprint(self.db)
+        self.system_prompt = prompts.build_system_prompt(
+            schema_context.build_schema_context(self.db),
+            self.settings.restricted_column_names,
+        )
+        self.prompt_version = cache.key_for(self.system_prompt)[:12]
 
     def ask(self, question: str) -> NLQResult:
         """Answer one question.
@@ -124,15 +167,84 @@ class NLQAgent:
         NLQResult whose `answer` is safe to show a non-technical user.
         """
         question = (question or "").strip()
+        request_id = observability.new_request_id()
         if not question:
-            return NLQResult(question, Outcome.FAILED, "Please enter a question.")
+            return NLQResult(question, Outcome.FAILED, "Please enter a question.",
+                             request_id=request_id, model=self.settings.model)
 
-        run = _Run(question=question, request=self._initial_request(question))
-        try:
-            return self._pipeline(run)
-        except NLQError as exc:
-            log.warning("Question failed (%s): %s", type(exc).__name__, exc)
-            return self._failure(run, exc.user_message)
+        result = self._answer(question, request_id)
+        # Recorded on every path -- answered, declined, failed, served from
+        # cache -- because an audit trail with holes in it answers nothing.
+        self.audit.record(result)
+        return result
+
+    def _answer(self, question: str, request_id: str) -> NLQResult:
+        """The cache-aware body of ask(). One exit, so the correlation id and
+        the end-to-end timing are stamped on every outcome exactly once."""
+        started = time.monotonic()
+        self._refresh_schema()
+
+        key = self._cache_key(question)
+        hit = self.cache.get(key)
+        if hit is not None:
+            log.debug("Cache hit for %r", question)
+            # Usage is zeroed, not inherited: serving this cost nothing, and a
+            # cost dashboard that sums the field would otherwise bill every
+            # cache hit for the calls the original answer made.
+            result = replace(hit, cached=True, usage=TokenUsage())
+        else:
+            deadline = Deadline.after(self.settings.total_deadline_seconds)
+            run = _Run(question=question, deadline=deadline,
+                       request=self._initial_request(question, deadline))
+            try:
+                result = self._pipeline(run)
+            except NLQError as exc:
+                log.warning("Question failed (%s): %s", type(exc).__name__, exc)
+                result = self._failure(run, exc.user_message)
+            else:
+                # Only successes are cached. Replaying a failure would hide a
+                # transient outage behind a stale error for the whole TTL.
+                self.cache.put(key, result)
+
+        return replace(result, request_id=request_id,
+                       total_seconds=time.monotonic() - started)
+
+    def _cache_key(self, question: str) -> str:
+        """Everything an answer depends on, so nothing else can be served.
+
+        The business date is in the key because "last month" means a different
+        window tomorrow; the schema fingerprint and prompt version are in it
+        because a migration or a prompt change invalidates every prior answer;
+        the model is in it because two models do not have to agree.
+        """
+        return cache.key_for(
+            question.casefold(),
+            business_today(self.settings),
+            self.schema_fingerprint,
+            self.prompt_version,
+            self.settings.model,
+        )
+
+    def _refresh_schema(self) -> None:
+        """Rebuild the prompt if the database changed under a long-lived process.
+
+        Streamlit caches one agent for the life of the process, so without this
+        a migration leaves the prompt describing columns that no longer exist,
+        and every question fails until someone restarts it. Rate-limited
+        because the check is cheap (PRAGMA only) but not free.
+        """
+        interval = self.settings.schema_check_interval_seconds
+        if interval <= 0 or time.monotonic() - self._schema_checked_at < interval:
+            return
+        self._schema_checked_at = time.monotonic()
+        if schema_context.fingerprint(self.db) == self.schema_fingerprint:
+            return
+        log.info("Schema changed; rebuilding the prompt and dropping cached answers.")
+        self._build_prompt()
+        # Entries keyed on the old fingerprint can never be hit again, so this
+        # is housekeeping rather than correctness -- but an agent that answers
+        # from a schema it no longer describes is worth being explicit about.
+        self.cache.clear()
 
     # -- pipeline ---------------------------------------------------------
 
@@ -161,6 +273,7 @@ class NLQAgent:
             truncated=result.truncated,
             elapsed_seconds=result.elapsed_seconds,
             usage=run.usage,
+            **self._provenance(),
         )
 
     def _execute_with_repair(self, run: _Run, plan: SqlPlan
@@ -171,9 +284,16 @@ class NLQAgent:
         prompt is wrong, and retrying would burn tokens on the same bug.
         """
         for remaining in range(self.settings.max_repair_attempts, -1, -1):
-            sql, limit_added = guards.enforce_limit(plan.sql, self.settings.max_rows)
+            run.deadline.check("running the query")
+            sql, limit_added = guards.enforce_limit(
+                plan.sql, self.settings.max_rows, self.rules
+            )
             try:
-                result = self.db.run_select(sql)
+                # The query gets whatever is left of the question's budget, not
+                # its own full timeout, so a slow query cannot overrun it.
+                result = self.db.run_select(
+                    sql, run.deadline.clamp(self.db.timeout_seconds)
+                )
             except QueryExecutionError as exc:
                 run.attempts.append(Attempt(sql=sql, error=exc.sqlite_message))
                 if remaining == 0:
@@ -214,7 +334,7 @@ class NLQAgent:
 
     # -- model calls ------------------------------------------------------
 
-    def _initial_request(self, question: str) -> ModelRequest:
+    def _initial_request(self, question: str, deadline: Deadline) -> ModelRequest:
         return ModelRequest(
             system=self.system_prompt,
             messages=(Message("user", prompts.build_question_turn(
@@ -222,10 +342,12 @@ class NLQAgent:
             max_tokens=self.settings.sql_max_tokens,
             effort=self.settings.sql_effort,
             response_schema=SqlPlan.model_json_schema(),
+            deadline=deadline,
         )
 
     def _plan(self, run: _Run) -> SqlPlan:
         """Natural language -> SqlPlan, via structured outputs."""
+        run.deadline.check("planning the query")
         response = self.client.complete(run.request)
         run.usage += response.usage
         try:
@@ -240,6 +362,7 @@ class NLQAgent:
 
     def _synthesize(self, run: _Run, sql: str, result: QueryResult) -> str:
         """Rows -> plain-English answer. Cheap call; no schema needed."""
+        run.deadline.check("writing the answer")
         response = self.client.complete(ModelRequest(
             system=prompts.ANSWER_SYSTEM_PROMPT,
             messages=(Message("user", prompts.build_answer_turn(
@@ -251,6 +374,7 @@ class NLQAgent:
             )),),
             max_tokens=self.settings.answer_max_tokens,
             effort=self.settings.answer_effort,
+            deadline=run.deadline,
         ))
         run.usage += response.usage
         return response.text.strip()
@@ -273,6 +397,7 @@ class NLQAgent:
             outcome=Outcome.DECLINED,
             answer=f"{reason}\n\n{self._scope()}",
             usage=run.usage,
+            **self._provenance(),
         )
 
     def _failure(self, run: _Run, message: str) -> NLQResult:
@@ -283,4 +408,9 @@ class NLQAgent:
             sql=run.attempts[-1].sql if run.attempts else "",
             attempts=tuple(run.attempts),
             usage=run.usage,
+            **self._provenance(),
         )
+
+    def _provenance(self) -> dict[str, str]:
+        """Which model and which prompt revision produced this answer."""
+        return {"model": self.settings.model, "prompt_version": self.prompt_version}
