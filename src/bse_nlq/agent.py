@@ -173,12 +173,14 @@ class NLQAgent:
         question = (question or "").strip()
         request_id = observability.new_request_id()
         if not question:
-            return NLQResult(question, Outcome.FAILED, "Please enter a question.",
-                             request_id=request_id, model=self.settings.model)
-
-        result = self._answer(question, request_id)
-        # Recorded on every path -- answered, declined, failed, served from
-        # cache -- because an audit trail with holes in it answers nothing.
+            result = NLQResult(question, Outcome.FAILED, "Please enter a question.",
+                               request_id=request_id, model=self.settings.model,
+                               prompt_version=self.prompt_version)
+        else:
+            result = self._answer(question, request_id)
+        # Recorded on every path -- answered, declined, failed, empty, served
+        # from cache -- because an audit trail with holes in it answers
+        # nothing. An early return here put one hole in it.
         self.audit.record(result)
         return result
 

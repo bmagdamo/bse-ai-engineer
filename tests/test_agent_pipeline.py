@@ -394,11 +394,14 @@ def test_every_question_is_audited(db, tmp_path):
     agent.ask("How many venues?")
     agent.ask("How many venues?")          # a cache hit is still an audit event
     agent.ask("Which campaign won?")
+    agent.ask("   ")                       # and so is a blank submission
 
     records = [json.loads(line) for line in path.read_text().splitlines()]
-    assert [r["outcome"] for r in records] == ["answered", "answered", "declined"]
-    assert [r["cached"] for r in records] == [False, True, False]
-    assert len({r["request_id"] for r in records}) == 3
+    assert [r["outcome"] for r in records] == [
+        "answered", "answered", "declined", "failed",
+    ]
+    assert [r["cached"] for r in records] == [False, True, False, False]
+    assert len({r["request_id"] for r in records}) == 4
 
 
 # --- column-level access control, end to end --------------------------------
