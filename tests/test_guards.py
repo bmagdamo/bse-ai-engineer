@@ -56,6 +56,16 @@ def test_adds_limit_when_missing():
     assert "LIMIT 50" in sql.upper()
 
 
+def test_adds_limit_to_roots_without_a_limit_slot():
+    """Only a Select carries a "limit" arg unconditionally; a UNION or a
+    parenthesised subquery has none until one is parsed."""
+    for query in ("SELECT a FROM events UNION SELECT b FROM venues",
+                  "(SELECT a FROM events)"):
+        sql, added = enforce_limit(query, max_rows=50)
+        assert added is True
+        assert "LIMIT 50" in sql.upper()
+
+
 def test_respects_smaller_existing_limit():
     sql, added = enforce_limit("SELECT * FROM events LIMIT 5", max_rows=50)
     assert added is False

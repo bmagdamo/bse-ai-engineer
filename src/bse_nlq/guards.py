@@ -142,11 +142,17 @@ def validate(sql: str, rules: tuple[Rule, ...] = RULES) -> exp.Expression:
 def _existing_limit(root: exp.Expression) -> int | None:
     """The row limit already in the query, when it is a plain integer literal.
 
-    Anything else -- a placeholder, an expression -- reads as None so the
-    caller replaces it rather than trusting a bound it cannot evaluate.
+    Anything else -- a placeholder, an expression, or a root that cannot
+    carry a LIMIT at all -- reads as None so the caller replaces it rather
+    than trusting a bound it cannot evaluate.
+
+    .get, not [], because only a Select carries a "limit" key unconditionally:
+    on the other READ_ROOTS (a UNION, a parenthesised subquery) the key is
+    absent until a LIMIT is actually parsed, and a KeyError here escapes the
+    suppression and every handler above it.
     """
     with suppress(AttributeError, TypeError, ValueError):
-        return int(root.args["limit"].expression.this)
+        return int(root.args.get("limit").expression.this)
     return None
 
 
