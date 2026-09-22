@@ -9,6 +9,8 @@ prompt would change the cached prefix on every single request.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 ROLE_AND_RULES = """\
 You are a careful data analyst for Brooklyn Sports & Entertainment (BSE), which
 operates Barclays Center and the Brooklyn Nets and New York Liberty franchises.
@@ -146,16 +148,39 @@ unanswerable_reason -- and say what related question you COULD answer.
 """
 
 
-def build_system_prompt(schema_context: str) -> str:
-    """Assemble the full system prompt. Byte-stable for a given database."""
-    return "\n\n".join([
+def render_restrictions(columns: Sequence[str]) -> str:
+    """Declare access-controlled columns to the model.
+
+    The guard already rejects a query that reads one (guards.restricted_columns);
+    telling the model as well is what turns a rejection into a clean decline.
+    Without this the user sees "that query was blocked" for a question the
+    agent could have answered differently, or not at all.
+    """
+    return (
+        "## Restricted columns\n\n"
+        "These columns are access-controlled. Never name one, in any clause:\n"
+        f"  {', '.join(sorted(columns))}\n"
+        "A query that names one is rejected before it runs. For the same reason "
+        "never write SELECT * or table.* -- a wildcard expands to include them. "
+        "If a question cannot be answered without a restricted column, set "
+        "is_answerable to false and say which column is restricted."
+    )
+
+
+def build_system_prompt(schema_context: str, restricted_columns: Sequence[str] = ()) -> str:
+    """Assemble the full system prompt. Byte-stable for a given database and
+    access policy -- which is what keeps the prompt cache hitting."""
+    sections = [
         ROLE_AND_RULES,
         schema_context,
         METRIC_DEFINITIONS,
         DATE_RECIPES,
         FEW_SHOT_EXAMPLES,
         OUTPUT_CONTRACT,
-    ])
+    ]
+    if restricted_columns:
+        sections.insert(2, render_restrictions(restricted_columns))
+    return "\n\n".join(sections)
 
 
 def build_question_turn(question: str, today: str, timezone: str) -> str:

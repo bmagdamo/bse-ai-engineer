@@ -102,6 +102,18 @@ class Settings:
     # retried, can stack into minutes. See deadline.Deadline.
     total_deadline_seconds: float = 120.0
 
+    # --- governance ----------------------------------------------------
+    # Columns no generated query may read, comma-separated. Enforced in the
+    # guard (see guards.restricted_columns) and declared in the prompt, so the
+    # model declines rather than writing SQL that is then rejected.
+    #
+    # Off by default, deliberately. Which columns are sensitive is a property
+    # of the deployment, not of the code, and there is no list that is right
+    # everywhere -- so the choice is explicit (NLQ_RESTRICTED_COLUMNS=email)
+    # rather than guessed. Turning it on also bans SELECT *, which would
+    # otherwise be the way around it.
+    restricted_columns: str = ""
+
     @classmethod
     def from_env(cls, **overrides) -> Settings:
         """Build settings from NLQ_* environment variables, then apply
@@ -153,6 +165,15 @@ class Settings:
                 f"it into your shell. [{where}]"
             )
         return key
+
+    @property
+    def restricted_column_names(self) -> tuple[str, ...]:
+        """`restricted_columns` parsed once, lowercased and de-blanked."""
+        return tuple(
+            name.strip().casefold()
+            for name in self.restricted_columns.split(",")
+            if name.strip()
+        )
 
     def require_database(self) -> Path:
         if not self.db_path.exists():

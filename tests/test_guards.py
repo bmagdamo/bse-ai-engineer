@@ -107,3 +107,62 @@ def test_rejections_are_logged_with_the_rule_name(caplog):
             pytest.raises(UnsafeSQLError):
         validate("DROP TABLE events")
     assert any("read_only_root" in r.getMessage() for r in caplog.records)
+
+
+# --- column-level access control -------------------------------------------
+
+def test_policy_is_the_baseline_rules_until_columns_are_restricted():
+    """The default path must carry no extra work and no extra rule."""
+    from bse_nlq.guards import RULES, policy_for
+
+    assert policy_for(()) is RULES
+    assert policy_for(("", "  ")) is RULES, "blank entries do not enable the rule"
+    assert len(policy_for(("email",))) == len(RULES) + 1
+
+
+RESTRICTED = [
+    ("SELECT email FROM customers", "bare column"),
+    ("SELECT c.email FROM customers c", "qualified column"),
+    ("SELECT COUNT(DISTINCT email) FROM customers", "inside an aggregate"),
+    ("SELECT 1 FROM customers WHERE email LIKE '%@x.com'", "in a WHERE clause"),
+    ("SELECT 1 FROM customers ORDER BY email", "in ORDER BY"),
+    ("WITH c AS (SELECT email FROM customers) SELECT * FROM c", "inside a CTE"),
+    ("SELECT * FROM customers", "a wildcard would expand to include it"),
+    ("SELECT c.* FROM customers c", "a qualified wildcard, likewise"),
+]
+
+ALLOWED = [
+    ("SELECT COUNT(*) FROM customers", "COUNT(*) names no column"),
+    ("SELECT first_name, city FROM customers", "unrestricted columns"),
+    ("SELECT city, COUNT(*) FROM customers GROUP BY city", "an aggregate by city"),
+    ("SELECT city AS email FROM customers", "aliasing reads city, not email"),
+]
+
+
+@pytest.mark.parametrize("sql", [pytest.param(s, id=label) for s, label in RESTRICTED])
+def test_restricted_columns_are_rejected(sql):
+    from bse_nlq.guards import policy_for
+
+    with pytest.raises(UnsafeSQLError):
+        validate(sql, policy_for(("email",)))
+
+
+@pytest.mark.parametrize("sql", [pytest.param(s, id=label) for s, label in ALLOWED])
+def test_the_rest_of_the_table_is_still_queryable(sql):
+    from bse_nlq.guards import policy_for
+
+    assert validate(sql, policy_for(("email",))) is not None
+
+
+def test_the_restriction_is_off_unless_configured():
+    """`SELECT *` is only banned as the price of restricting a column."""
+    assert validate("SELECT * FROM customers") is not None
+
+
+def test_a_rejection_names_the_rule_and_the_column(caplog):
+    from bse_nlq.guards import policy_for
+
+    with caplog.at_level(logging.WARNING, logger="bse_nlq.guards"), \
+            pytest.raises(UnsafeSQLError, match="email"):
+        validate("SELECT email FROM customers", policy_for(("Email",)))
+    assert any("restricted_columns" in r.getMessage() for r in caplog.records)
