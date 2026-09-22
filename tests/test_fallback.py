@@ -91,6 +91,24 @@ def test_the_circuit_closes_again_after_the_cooldown():
     assert primary.calls == 3, "the next request through is the probe"
 
 
+def test_a_failed_probe_reopens_the_circuit_immediately():
+    """A prolonged outage should cost one probe per cooldown, not a fresh run
+    at the threshold -- every readmitted request pays its own retry backoff
+    against an endpoint that is still down."""
+    primary, backup = _Stub(TransientModelError("still down")), _Stub()
+    client = FallbackClient(primary, backup, settings=QUICK)
+    for _ in range(3):
+        client.complete(REQUEST)
+    assert primary.calls == QUICK.breaker_failure_threshold
+
+    time.sleep(QUICK.breaker_cooldown_seconds + 0.01)
+    for _ in range(3):
+        client.complete(REQUEST)
+    assert primary.calls == QUICK.breaker_failure_threshold + 1, (
+        "the probe failed, so the circuit should have reopened on that one call"
+    )
+
+
 def test_a_success_resets_the_failure_count():
     flaky, backup = _Stub(TransientModelError("blip")), _Stub()
     client = FallbackClient(flaky, backup, settings=QUICK)

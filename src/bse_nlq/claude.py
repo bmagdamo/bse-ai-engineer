@@ -340,7 +340,12 @@ class _Breaker:
             if self._failures < self.threshold:
                 return False
             if time.monotonic() - self._opened_at >= self.cooldown_seconds:
-                self._failures = 0      # cooled down: let the next call probe
+                # Cooled down: let the next call through as the probe, but
+                # hold the count one short of the threshold so a single failed
+                # probe reopens the circuit. Resetting to zero readmitted
+                # `threshold` requests to a still-dead endpoint every cooldown,
+                # each paying its own retry backoff before falling through.
+                self._failures = self.threshold - 1
                 return False
             return True
 
@@ -351,7 +356,7 @@ class _Breaker:
     def record_failure(self) -> None:
         with self._lock:
             self._failures += 1
-            if self._failures == self.threshold:
+            if self._failures >= self.threshold:
                 self._opened_at = time.monotonic()
                 log.warning("Model circuit opened for %.0fs after %d failures",
                             self.cooldown_seconds, self._failures)
