@@ -137,6 +137,21 @@ def test_retries_are_logged(caplog):
     assert any("retrying" in record.getMessage().lower() for record in caplog.records)
 
 
+def test_retries_are_logged_on_a_deadline_bound_request(caplog):
+    """Every question sets a deadline, which makes the stop policy a stop_any.
+    Reading the attempt budget back off it raised AttributeError from inside
+    before_sleep, so the first transient blip failed the whole call."""
+    from bse_nlq.deadline import Deadline
+
+    sdk = _FlakySDK(_status_error(anthropic.InternalServerError, 500))
+    request = ModelRequest(system="s", messages=(Message("user", "q"),),
+                           max_tokens=10, effort="low",
+                           deadline=Deadline.after(60))
+    with caplog.at_level(logging.WARNING, logger="bse_nlq.claude"):
+        assert _client(sdk).complete(request).text == "ok"
+    assert any("retrying" in record.getMessage().lower() for record in caplog.records)
+
+
 def test_server_retry_after_is_honoured_beyond_our_own_backoff_ceiling():
     """retry_max_seconds bounds *our* guess at a backoff. Clamping the
     server's own `retry-after` to it meant waiting 10s when the API asked for

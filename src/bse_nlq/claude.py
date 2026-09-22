@@ -141,13 +141,22 @@ def _stop_policy(settings: Settings, deadline: Deadline | None):
     return stop_any(attempts, lambda _state: deadline.expired)
 
 
-def _log_retry(state: RetryCallState) -> None:
-    exc = state.outcome.exception() if state.outcome else None
-    log.warning(
-        "Claude API call failed (attempt %d/%s): %s -- retrying in %.1fs",
-        state.attempt_number, state.retry_object.stop.max_attempt_number,
-        exc, state.idle_for,
-    )
+def _retry_logger(settings: Settings):
+    """A `before_sleep` hook that reports the attempt budget it was built with.
+
+    The budget is passed in rather than read back off `state.retry_object.stop`:
+    with a deadline that policy is a `stop_any`, which carries no
+    max_attempt_number, and an AttributeError raised inside before_sleep
+    escapes the retry loop as a failure nothing above it is catching.
+    """
+    def log_retry(state: RetryCallState) -> None:
+        exc = state.outcome.exception() if state.outcome else None
+        log.warning(
+            "Claude API call failed (attempt %d/%d): %s -- retrying in %.1fs",
+            state.attempt_number, settings.max_attempts, exc, state.idle_for,
+        )
+
+    return log_retry
 
 
 class ClaudeClient:
@@ -179,7 +188,7 @@ class ClaudeClient:
             retry=retry_if_exception_type(TransientModelError),
             stop=_stop_policy(self.settings, request.deadline),
             wait=_wait_policy(self.settings),
-            before_sleep=_log_retry,
+            before_sleep=_retry_logger(self.settings),
             reraise=True,
         )
         try:
