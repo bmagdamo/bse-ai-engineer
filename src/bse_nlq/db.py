@@ -147,9 +147,16 @@ class Database:
 
     # -- execution --------------------------------------------------------
 
-    def run_select(self, sql: str) -> QueryResult:
-        """Execute a validated SELECT under the authorizer, row cap, and timeout."""
+    def run_select(self, sql: str, timeout_seconds: float | None = None) -> QueryResult:
+        """Execute a validated SELECT under the authorizer, row cap, and timeout.
+
+        `timeout_seconds` overrides the configured budget for this call, which
+        is how the agent hands down what is left of the question's end-to-end
+        deadline: a query allowed its full 20s inside a budget with 3s left
+        would blow the budget and report the wrong reason for it.
+        """
         conn = self._conn
+        budget = self.timeout_seconds if timeout_seconds is None else timeout_seconds
         timed_out = threading.Event()
 
         def _abort() -> None:
@@ -160,7 +167,7 @@ class Database:
         # PRAGMA, which it denies. That scoping is only safe because the
         # connection belongs to this thread alone.
         conn.set_authorizer(_authorizer)
-        watchdog = threading.Timer(self.timeout_seconds, _abort)
+        watchdog = threading.Timer(budget, _abort)
         watchdog.daemon = True
         watchdog.start()
         started = time.monotonic()
@@ -171,8 +178,8 @@ class Database:
         except sqlite3.Error as exc:
             if timed_out.is_set():
                 raise QueryTimeoutError(
-                    f"The query took longer than {self.timeout_seconds:.0f}s and was "
-                    "stopped. Try narrowing the question to a shorter time range."
+                    f"The query took longer than {budget:.0f}s and was stopped. "
+                    "Try narrowing the question to a shorter time range."
                 ) from exc
             log.warning("SQLite rejected the generated query: %s", exc)
             raise QueryExecutionError(

@@ -40,6 +40,15 @@ class QueryTimeoutError(NLQError):
     """Query exceeded the configured wall-clock budget and was aborted."""
 
 
+class DeadlineExceededError(NLQError):
+    """The whole question ran out of its end-to-end budget.
+
+    Distinct from QueryTimeoutError, which bounds one SQL statement: this one
+    bounds the sum of every stage, so a slow API plus a repair plus a synthesis
+    call cannot keep a user waiting past the budget.
+    """
+
+
 class ModelError(NLQError):
     """The Claude API call failed (auth, rate limit, overload, network)."""
 

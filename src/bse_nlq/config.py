@@ -86,6 +86,10 @@ class Settings:
     # One repair attempt: enough to fix a mistyped column, not enough to burn
     # budget looping on a fundamentally wrong query.
     max_repair_attempts: int = 1
+    # The end-to-end budget for one question. Every stage is individually
+    # bounded, but nothing bounded their sum: plan + repair + synthesize, each
+    # retried, can stack into minutes. See deadline.Deadline.
+    total_deadline_seconds: float = 120.0
 
     @classmethod
     def from_env(cls, **overrides) -> Settings:
@@ -152,6 +156,7 @@ class Settings:
 _FLOORS = {
     "max_rows": 1, "max_attempts": 1, "max_repair_attempts": 0,
     "query_timeout_seconds": 0, "sql_max_tokens": 1, "answer_max_tokens": 1,
+    "total_deadline_seconds": 1,
 }
 
 #: field -> caster, derived from the annotations so the two cannot drift.

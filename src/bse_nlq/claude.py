@@ -18,10 +18,12 @@ from tenacity import (
     Retrying,
     retry_if_exception_type,
     stop_after_attempt,
+    stop_any,
     wait_exponential_jitter,
 )
 
 from bse_nlq.config import SETTINGS, Settings
+from bse_nlq.deadline import Deadline
 from bse_nlq.errors import ModelError, TransientModelError
 
 log = logging.getLogger(__name__)
@@ -78,6 +80,9 @@ class ModelRequest:
     effort: str
     response_schema: dict | None = None
     """When set, the model is constrained to emit JSON matching this schema."""
+    deadline: Deadline | None = None
+    """The end-to-end budget for the question this call belongs to. The client
+    lowers its own timeout to fit, and stops retrying once it is spent."""
 
     def with_messages(self, *messages: Message) -> ModelRequest:
         return replace(self, messages=self.messages + messages)
@@ -121,6 +126,19 @@ def _wait_policy(settings: Settings):
     return wait
 
 
+def _stop_policy(settings: Settings, deadline: Deadline | None):
+    """Stop on the attempt budget, or as soon as the question's budget is gone.
+
+    Without the second condition the attempt budget wins: a request whose
+    deadline passed during the first backoff still sleeps and retries twice
+    more before anyone notices there is no time left to use the answer.
+    """
+    attempts = stop_after_attempt(settings.max_attempts)
+    if deadline is None:
+        return attempts
+    return stop_any(attempts, lambda _state: deadline.expired)
+
+
 def _log_retry(state: RetryCallState) -> None:
     exc = state.outcome.exception() if state.outcome else None
     log.warning(
@@ -149,19 +167,35 @@ class ClaudeClient:
         self._client = client or anthropic.Anthropic(
             max_retries=0,                                  # tenacity owns retries
             timeout=settings.request_timeout_seconds,       # never hang forever
-        )
+        )                                                   # lowered per call by
+        #                                                     the deadline, below
+
 
     def complete(self, request: ModelRequest) -> ModelResponse:
         """Send one request, retrying only transient failures."""
-        return Retrying(
+        retrying = Retrying(
             retry=retry_if_exception_type(TransientModelError),
-            stop=stop_after_attempt(self.settings.max_attempts),
+            stop=_stop_policy(self.settings, request.deadline),
             wait=_wait_policy(self.settings),
             before_sleep=_log_retry,
             reraise=True,
-        )(self._complete_once, request)
+        )
+        try:
+            return retrying(self._complete_once, request)
+        except TransientModelError:
+            # Retries that ran out of time report the budget, not the last
+            # blip: "the API was busy" is the cause, but "this took too long"
+            # is the thing the user can act on.
+            if request.deadline is not None and request.deadline.expired:
+                request.deadline.check("the model call")
+            raise
 
     def _complete_once(self, request: ModelRequest) -> ModelResponse:
+        timeout = self.settings.request_timeout_seconds
+        if request.deadline is not None:
+            request.deadline.check("the model call")
+            timeout = request.deadline.clamp(timeout)
+
         output_config: dict = {"effort": request.effort}
         if request.response_schema is not None:
             output_config["format"] = {
@@ -182,6 +216,9 @@ class ClaudeClient:
                 }],
                 messages=[m.as_dict() for m in request.messages],
                 output_config=output_config,
+                # Per call, not per client: the ceiling is whichever is
+                # nearer, this call's own limit or what the question has left.
+                timeout=timeout,
             )
         except anthropic.APIError as exc:
             raise self._translate(exc) from exc
@@ -260,3 +297,4 @@ class ClaudeClient:
             return float(raw) if raw is not None else None
         except (TypeError, ValueError):
             return None
+

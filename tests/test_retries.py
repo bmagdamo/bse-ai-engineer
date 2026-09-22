@@ -39,10 +39,12 @@ class _FlakySDK:
     def __init__(self, *errors):
         self._errors = list(errors)
         self.calls = 0
+        self.kwargs = None
         self.messages = self
 
-    def create(self, **_):
+    def create(self, **kwargs):
         self.calls += 1
+        self.kwargs = kwargs
         if self._errors:
             raise self._errors.pop(0)
         return _Reply()
@@ -164,3 +166,37 @@ def test_a_pathological_retry_after_is_still_bounded():
     state.outcome.exception.return_value = TransientModelError("rl", retry_after=86_400.0)
 
     assert _wait_policy(settings)(state) == 60.0
+
+
+# --- the end-to-end budget bounds the retry loop ----------------------------
+
+def test_the_per_call_timeout_is_lowered_to_what_the_budget_has_left():
+    """A call allowed its full timeout inside a budget with seconds left would
+    overrun the budget and report the wrong reason for it."""
+    from bse_nlq.deadline import Deadline
+
+    sdk = _FlakySDK()
+    request = ModelRequest(system="s", messages=(Message("user", "q"),), max_tokens=10,
+                           effort="low", deadline=Deadline.after(2.0))
+    _client(sdk).complete(request)
+    assert 0 < sdk.kwargs["timeout"] <= 2.0
+
+
+def test_a_request_with_no_deadline_keeps_the_configured_timeout():
+    sdk = _FlakySDK()
+    _client(sdk).complete(_request())
+    assert sdk.kwargs["timeout"] == FAST.request_timeout_seconds
+
+
+def test_an_expired_budget_stops_the_retry_loop_and_reports_the_budget():
+    """Without this the attempt budget wins: the request sleeps and retries
+    twice more after there is no time left to use the answer."""
+    from bse_nlq.deadline import Deadline
+    from bse_nlq.errors import DeadlineExceededError
+
+    sdk = _FlakySDK(*[_status_error(anthropic.InternalServerError, 500)] * 5)
+    request = ModelRequest(system="s", messages=(Message("user", "q"),), max_tokens=10,
+                           effort="low", deadline=Deadline(0.0))
+    with pytest.raises(DeadlineExceededError):
+        _client(sdk).complete(request)
+    assert sdk.calls == 0, "a call that cannot finish in budget is never started"
