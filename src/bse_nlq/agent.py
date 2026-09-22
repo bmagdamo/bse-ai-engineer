@@ -120,6 +120,10 @@ class _Run:
     deadline: Deadline
     usage: TokenUsage = TokenUsage()
     attempts: list[Attempt] = field(default_factory=list)
+    model: str = ""
+    """Whichever model last answered, for provenance. Read back off the
+    response rather than assumed from the settings, so a question the fallback
+    served is attributed to the fallback."""
 
 
 class NLQAgent:
@@ -273,7 +277,7 @@ class NLQAgent:
             truncated=result.truncated,
             elapsed_seconds=result.elapsed_seconds,
             usage=run.usage,
-            **self._provenance(),
+            **self._provenance(run),
         )
 
     def _execute_with_repair(self, run: _Run, plan: SqlPlan
@@ -350,6 +354,7 @@ class NLQAgent:
         run.deadline.check("planning the query")
         response = self.client.complete(run.request)
         run.usage += response.usage
+        run.model = response.model or run.model
         try:
             return SqlPlan.model_validate_json(response.text)
         except ValueError as exc:
@@ -377,6 +382,7 @@ class NLQAgent:
             deadline=run.deadline,
         ))
         run.usage += response.usage
+        run.model = response.model or run.model
         return response.text.strip()
 
     # -- result builders --------------------------------------------------
@@ -397,7 +403,7 @@ class NLQAgent:
             outcome=Outcome.DECLINED,
             answer=f"{reason}\n\n{self._scope()}",
             usage=run.usage,
-            **self._provenance(),
+            **self._provenance(run),
         )
 
     def _failure(self, run: _Run, message: str) -> NLQResult:
@@ -408,9 +414,14 @@ class NLQAgent:
             sql=run.attempts[-1].sql if run.attempts else "",
             attempts=tuple(run.attempts),
             usage=run.usage,
-            **self._provenance(),
+            **self._provenance(run),
         )
 
-    def _provenance(self) -> dict[str, str]:
-        """Which model and which prompt revision produced this answer."""
-        return {"model": self.settings.model, "prompt_version": self.prompt_version}
+    def _provenance(self, run: _Run) -> dict[str, str]:
+        """Which model and which prompt revision produced this answer.
+
+        The configured model is only the fallback for a run that never reached
+        a model at all; otherwise this is the one that actually served it.
+        """
+        return {"model": run.model or self.settings.model,
+                "prompt_version": self.prompt_version}

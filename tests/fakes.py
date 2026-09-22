@@ -20,8 +20,9 @@ class FakeModelClient:
     returned verbatim (a synthesis answer); an exception is raised.
     """
 
-    def __init__(self, *payloads: dict | str | Exception):
+    def __init__(self, *payloads: dict | str | Exception, model: str = ""):
         self._payloads = list(payloads)
+        self.model = model
         self.requests: list[ModelRequest] = []
 
     def complete(self, request: ModelRequest) -> ModelResponse:
@@ -36,6 +37,7 @@ class FakeModelClient:
             text=text,
             usage=TokenUsage(calls=1, input_tokens=100, output_tokens=50,
                              cache_read_tokens=10),
+            model=self.model,
         )
 
 

@@ -262,6 +262,19 @@ def test_every_answer_carries_the_model_and_prompt_that_produced_it(db):
     assert result.total_seconds > 0
 
 
+def test_the_answering_model_is_recorded_not_the_configured_one(db):
+    """When the fallback serves a question, an audit line naming the primary
+    attributes the answer to a model that never saw it."""
+    agent = NLQAgent(db, SETTINGS, client=FakeModelClient(
+        plan("SELECT 1 AS n"), "ok", model="claude-haiku-4-5"))
+    result = agent.ask("anything")
+    assert result.model == "claude-haiku-4-5" != SETTINGS.model
+
+
+def test_a_question_that_never_reached_a_model_falls_back_to_the_configured_one(db):
+    assert make_agent(db).ask("   ").model == SETTINGS.model
+
+
 def test_each_question_gets_its_own_correlation_id(db):
     agent = make_agent(db, plan("SELECT 1 AS n"), "ok", plan("SELECT 2 AS n"), "ok")
     first = agent.ask("one")

@@ -28,14 +28,16 @@ QUICK = Settings(breaker_failure_threshold=2, breaker_cooldown_seconds=0.05)
 class _Stub:
     """A ModelClient that raises `error` (if any) and counts its calls."""
 
-    def __init__(self, error: Exception | None = None, text: str = "ok"):
-        self.error, self.text, self.calls = error, text, 0
+    def __init__(self, error: Exception | None = None, text: str = "ok",
+                 model: str = ""):
+        self.error, self.text, self.model, self.calls = error, text, model, 0
 
     def complete(self, _request: ModelRequest) -> ModelResponse:
         self.calls += 1
         if self.error:
             raise self.error
-        return ModelResponse(text=self.text, usage=TokenUsage(calls=1))
+        return ModelResponse(text=self.text, usage=TokenUsage(calls=1),
+                             model=self.model)
 
 
 def test_fallback_is_itself_a_model_client():
@@ -48,6 +50,15 @@ def test_a_transient_failure_falls_through_to_the_next_model():
     client = FallbackClient(primary, backup, settings=QUICK)
     assert client.complete(REQUEST).text == "from backup"
     assert primary.calls == 1 and backup.calls == 1
+
+
+def test_a_fallback_answer_names_the_model_that_served_it():
+    """Provenance is read off the response, so the audit trail can tell which
+    model answered during an outage instead of naming the configured primary."""
+    primary = _Stub(TransientModelError("rate limited"), model="primary-model")
+    backup = _Stub(text="from backup", model="backup-model")
+    response = FallbackClient(primary, backup, settings=QUICK).complete(REQUEST)
+    assert response.model == "backup-model"
 
 
 def test_a_permanent_failure_does_not_fall_through():

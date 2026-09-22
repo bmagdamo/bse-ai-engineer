@@ -94,6 +94,11 @@ class ModelRequest:
 class ModelResponse:
     text: str
     usage: TokenUsage
+    model: str = ""
+    """Which model actually answered. Set by the client rather than read off
+    the settings by the caller, because `FallbackClient` may have served this
+    from the secondary -- and an audit trail that names the primary during an
+    outage attributes the answer to a model that never saw the question."""
 
 
 @runtime_checkable
@@ -235,7 +240,8 @@ class ClaudeClient:
             raise self._translate(exc) from exc
 
         self._check_stop_reason(response.stop_reason)
-        return ModelResponse(text=self._text_of(response), usage=self._usage_of(response))
+        return ModelResponse(text=self._text_of(response),
+                             usage=self._usage_of(response), model=self.model)
 
     # -- helpers ----------------------------------------------------------
 
