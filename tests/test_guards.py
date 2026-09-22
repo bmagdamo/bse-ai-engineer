@@ -76,51 +76,30 @@ def test_enforce_limit_still_rejects_unsafe_sql():
 
 # --- the rule set is an auditable composite --------------------------------
 
-def test_every_rule_satisfies_the_protocol():
-    from bse_nlq.guards import RULES, SqlRule
-    assert RULES, "the rule set must not be empty"
-    assert all(isinstance(rule, SqlRule) for rule in RULES)
-
-
-def test_rule_names_are_unique_and_stable():
-    from bse_nlq.guards import RULES
-    names = [rule.name for rule in RULES]
-    assert len(names) == len(set(names))
-    assert set(names) == {"single_statement", "read_only_root", "no_write_operations"}
-
-
-def test_rules_can_be_checked_in_isolation():
+def test_rules_are_enumerable_and_usable_in_isolation():
     import sqlglot
 
-    from bse_nlq.guards import NoWriteOperations, ReadOnlyRoot, SingleStatement
+    from bse_nlq.guards import RULES, no_write_operations, read_only_root, single_statement
 
-    select = sqlglot.parse("SELECT 1", read="sqlite")
-    two = sqlglot.parse("SELECT 1; SELECT 2", read="sqlite")
-    drop = sqlglot.parse("DROP TABLE events", read="sqlite")
+    assert (single_statement, read_only_root, no_write_operations) == RULES
 
-    assert SingleStatement().check(select) is None
-    assert SingleStatement().check(two).rule == "single_statement"
-    assert ReadOnlyRoot().check(select) is None
-    assert ReadOnlyRoot().check(drop).rule == "read_only_root"
-    assert NoWriteOperations().check(select) is None
+    def parse(sql):
+        return sqlglot.parse(sql, read="sqlite")
+
+    assert single_statement(parse("SELECT 1")) is None
+    assert single_statement(parse("SELECT 1; SELECT 2"))
+    assert read_only_root(parse("SELECT 1")) is None
+    assert read_only_root(parse("DROP TABLE events"))
+    assert no_write_operations(parse("SELECT 1")) is None
 
 
 def test_a_custom_rule_set_can_be_injected():
     """Rules are a parameter, so a caller can tighten or relax the policy
     without editing the guard."""
-    from dataclasses import dataclass
-
-    from bse_nlq.guards import Violation, validate
-
-    @dataclass(frozen=True)
-    class RejectEverything:
-        name: str = "reject_everything"
-
-        def check(self, statements) -> Violation | None:  # noqa: ARG002
-            return Violation(self.name, "Nothing is allowed here.")
+    from bse_nlq.guards import validate
 
     with pytest.raises(UnsafeSQLError, match="Nothing is allowed"):
-        validate("SELECT 1", rules=(RejectEverything(),))
+        validate("SELECT 1", rules=(lambda _statements: "Nothing is allowed here.",))
 
 
 def test_rejections_are_logged_with_the_rule_name(caplog):

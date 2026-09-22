@@ -1,8 +1,7 @@
 """The structured-output contract between the model and the agent.
 
-Constraints imposed by the structured-outputs API: every field must be
-required (so: no defaults) and objects must set additionalProperties: false
-(so: extra="forbid").
+The structured-outputs API requires every field to be required (so: no
+defaults) and objects to set additionalProperties: false (so: extra="forbid").
 """
 
 from __future__ import annotations
@@ -34,8 +33,3 @@ class SqlPlan(BaseModel):
     unanswerable_reason: str = Field(
         description="Why the question cannot be answered. Empty string when answerable."
     )
-
-
-def sql_plan_json_schema() -> dict:
-    """JSON Schema for the structured-outputs `format` parameter."""
-    return SqlPlan.model_json_schema()

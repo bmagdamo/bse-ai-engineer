@@ -1,12 +1,9 @@
 """Logging configuration, applied once at an entry point.
 
-A library must not configure logging on import -- that decision belongs to
-whoever is running the code. So the modules only ever call
-`logging.getLogger(__name__)`, and `configure()` is invoked by the CLI and the
-Streamlit app.
-
-Without this the agent's warnings go nowhere: a silently repaired query or a
-rejected unsafe query would leave no trace at all.
+A library must not configure logging on import -- that belongs to whoever
+runs the code -- so modules only call `logging.getLogger(__name__)` and the
+CLI and Streamlit app call `configure()`. Without it the agent's warnings go
+nowhere: a repaired query or a rejected unsafe query leaves no trace.
 """
 
 from __future__ import annotations

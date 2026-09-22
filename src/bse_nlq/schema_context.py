@@ -1,12 +1,10 @@
 """Turn the live database schema into prompt context.
 
-Introspected rather than hardcoded, so the prompt can never drift away from
-the actual schema.
-
-The value hints are the highest-leverage part of this module: telling the
-model that orders.status is one of {completed, refunded, cancelled} prevents
-the single most common text-to-SQL failure -- filtering on a plausible but
-non-existent literal like 'complete'.
+Introspected rather than hardcoded, so the prompt cannot drift from the real
+schema. The value hints are the highest-leverage part: telling the model that
+orders.status is one of {completed, refunded, cancelled} prevents the single
+most common text-to-SQL failure -- filtering on a plausible but non-existent
+literal like 'complete'.
 """
 
 from __future__ import annotations
@@ -50,12 +48,10 @@ def render_schema(db: Database) -> str:
 def render_value_hints(db: Database) -> str:
     """Enumerate the allowed literals for low-cardinality columns.
 
-    VALUE_HINT_COLUMNS is hand-picked rather than auto-detected: probing every
-    text column for cardinality would mean a COUNT(DISTINCT) over the 500k-row
-    tickets table at every startup. The tradeoff is that the list can drift
-    from the schema, so it is validated against the live database here and a
-    stale entry fails loudly instead of silently dropping a hint the prompt
-    depends on.
+    VALUE_HINT_COLUMNS is hand-picked, not auto-detected: probing every text
+    column would mean a COUNT(DISTINCT) over the tickets table at startup. The
+    cost is that the list can drift, so it is checked against the live schema
+    here -- a stale entry fails loudly rather than silently dropping a hint.
     """
     known = {table.name: {c.name for c in table.columns} for table in db.tables()}
     missing = [
@@ -80,11 +76,8 @@ def render_value_hints(db: Database) -> str:
 
 
 def render_date_range(db: Database) -> str:
-    """Tell the model what period the data actually covers.
-
-    Without this it will happily write a query for 2019 and report zero as if
-    it were a real business answer.
-    """
+    """What period the data covers. Without this the model will happily query
+    2019 and report zero as if it were a real business answer."""
     result = db.run_select("SELECT MIN(event_date), MAX(event_date) FROM events")
     if not result.rows:
         return "unknown"
